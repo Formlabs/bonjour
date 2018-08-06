@@ -5,8 +5,8 @@ import (
 	"log"
 	"math/rand"
 	"net"
-		"strings"
-		"sync"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -68,8 +68,7 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
 	}
 
-
-	for _, ipAddr := range(ips) {
+	for _, ipAddr := range (ips) {
 		if ipAddr == nil {
 			return nil, fmt.Errorf("Failed to parse given IP: %v", ipAddr)
 		} else if ipv4 := ipAddr.To4(); ipv4 != nil {
@@ -249,7 +248,6 @@ func (s *Server) recv(c *net.UDPConn) {
 
 			continue
 		}
-
 
 		i++
 		bytes += n
