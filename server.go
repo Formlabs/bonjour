@@ -7,11 +7,10 @@ import (
 	"net"
 	"os"
 	"strings"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
-
-	"encoding/binary"
-	"errors"
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
@@ -96,7 +95,9 @@ func Register(instance, service, domain string, port int, text []string, iface *
 	}
 
 	s.service = entry
-	//go s.mainloop()
+	s.service.HostName = strings.ToLower(s.service.HostName)
+
+	go s.mainloop()
 	go s.probe()
 
 	return s, nil
@@ -147,6 +148,8 @@ func RegisterProxy(instance, service, domain string, port int, host, ip string, 
 	}
 
 	s.service = entry
+	s.service.HostName = strings.ToLower(s.service.HostName)
+
 	go s.mainloop()
 	go s.probe()
 
@@ -210,7 +213,7 @@ func newServer(iface *net.Interface) (*Server, error) {
 	s := &Server{
 		ipv4conn: ipv4conn,
 		//ipv6conn: ipv6conn,
-		ttl:      3200,
+		ttl: 3200,
 	}
 
 	return s, nil
@@ -268,14 +271,52 @@ func (s *Server) recv(c *net.UDPConn) {
 	if c == nil {
 		return
 	}
+
+	f, _ := c.File()
+	fd, _ := syscall.Dup(int(f.Fd()))
+
+	// duplicating the fd because c.fd which holds the actual one gets garbage collected
+	e := syscall.SetNonblock(fd, true)
+	if e != nil {
+		println("Could not set nonblock", e)
+	}
+	c.SetReadBuffer(4000000)
+	if e != nil {
+		println("Could not set buffer size", e)
+	}
 	buf := make([]byte, 65536)
+
+	i := 0
+	bytes := 0
+
 	for !s.shouldShutdown {
-		n, from, err := c.ReadFrom(buf)
+		n, sa, err := syscall.Recvfrom(fd, buf, 0)
+		var from *net.UDPAddr
+		switch sa := sa.(type) {
+		case *syscall.SockaddrInet4:
+			from = &net.UDPAddr{IP: sa.Addr[0:], Port: sa.Port}
+		case *syscall.SockaddrInet6:
+			from = &net.UDPAddr{IP: sa.Addr[0:], Port: sa.Port}
+		}
+
 		if err != nil {
+			n = 0
+		}
+
+		if n == 0 {
+			time.Sleep(50 * time.Millisecond)
+			i = 0
+			bytes = 0
+
 			continue
 		}
+
+
+		i++
+		bytes += n
+
 		if err := s.parsePacket(buf[:n], from); err != nil {
-			log.Printf("[ERR] bonjour: Failed to handle query: %v", err)
+			//log.Printf("[ERR] bonjour: Failed to handle query: %v", err)
 		}
 	}
 }
@@ -284,200 +325,12 @@ func (s *Server) recv(c *net.UDPConn) {
 func (s *Server) parsePacket(packet []byte, from net.Addr) error {
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
-	//if err := UnpackDnsMsg(&msg, packet); err != nil {
-		log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
+		if err != dns.ErrTruncated {
+			log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
+		}
 		return err
 	}
 	return s.handleQuery(&msg, from)
-}
-
-
-func unpackUint16(msg []byte, off int) (i uint16, off1 int, err error) {
-	if off+2 > len(msg) {
-		return 0, len(msg), errors.New("overflow")
-	}
-	return binary.BigEndian.Uint16(msg[off:]), off + 2, nil
-}
-
-func unpackMsgHdr(msg []byte, off int) (dns.Header, int, error) {
-	var (
-		dh  dns.Header
-		err error
-	)
-	dh.Id, off, err = unpackUint16(msg, off)
-	if err != nil {
-		return dh, off, err
-	}
-	dh.Bits, off, err = unpackUint16(msg, off)
-	if err != nil {
-		return dh, off, err
-	}
-	dh.Qdcount, off, err = unpackUint16(msg, off)
-	if err != nil {
-		return dh, off, err
-	}
-	dh.Ancount, off, err = unpackUint16(msg, off)
-	if err != nil {
-		return dh, off, err
-	}
-	dh.Nscount, off, err = unpackUint16(msg, off)
-	if err != nil {
-		return dh, off, err
-	}
-	dh.Arcount, off, err = unpackUint16(msg, off)
-	return dh, off, err
-}
-
-const (
-	headerSize = 12
-
-	// Header.Bits
-	_QR = 1 << 15 // query/response (response=1)
-	_AA = 1 << 10 // authoritative
-	_TC = 1 << 9  // truncated
-	_RD = 1 << 8  // recursion desired
-	_RA = 1 << 7  // recursion available
-	_Z  = 1 << 6  // Z
-	_AD = 1 << 5  // authticated data
-	_CD = 1 << 4  // checking disabled
-)
-
-func unpackQuestion(msg []byte, off int) (dns.Question, int, error) {
-	var (
-		q   dns.Question
-		err error
-	)
-	q.Name, off, err = dns.UnpackDomainName(msg, off)
-	if err != nil {
-		return q, off, err
-	}
-	if off == len(msg) {
-		return q, off, nil
-	}
-	q.Qtype, off, err = unpackUint16(msg, off)
-	if err != nil {
-		return q, off, err
-	}
-	if off == len(msg) {
-		return q, off, nil
-	}
-	q.Qclass, off, err = unpackUint16(msg, off)
-	if off == len(msg) {
-		return q, off, nil
-	}
-	return q, off, err
-}
-
-// unpackRRslice unpacks msg[off:] into an []RR.
-// If we cannot unpack the whole array, then it will return nil
-func unpackRRslice(l int, msg []byte, off int) (dst1 []dns.RR, off1 int, err error) {
-	var r dns.RR
-	// Don't pre-allocate, l may be under attacker control
-	var dst []dns.RR
-	for i := 0; i < l; i++ {
-		off1 := off
-		r, off, err = dns.UnpackRR(msg, off)
-		//println("RR slice", r.String())
-		if err != nil {
-			off = len(msg)
-			break
-		}
-		// If offset does not increase anymore, l is a lie
-		if off1 == off {
-			l = i
-			break
-		}
-		dst = append(dst, r)
-	}
-	if err != nil && off == len(msg) {
-		dst = nil
-	}
-	return dst, off, err
-}
-
-// Unpack unpacks a binary message to a Msg structure.
-func UnpackDnsMsg(m *dns.Msg, msg []byte) (err error) {
-	var (
-		dh  dns.Header
-		off int
-	)
-	if dh, off, err = unpackMsgHdr(msg, off); err != nil {
-		return err
-	}
-
-	m.Id = dh.Id
-	m.Response = (dh.Bits & _QR) != 0
-	m.Opcode = int(dh.Bits>>11) & 0xF
-	m.Authoritative = (dh.Bits & _AA) != 0
-	m.Truncated = (dh.Bits & _TC) != 0
-	m.RecursionDesired = (dh.Bits & _RD) != 0
-	m.RecursionAvailable = (dh.Bits & _RA) != 0
-	m.Zero = (dh.Bits & _Z) != 0
-	m.AuthenticatedData = (dh.Bits & _AD) != 0
-	m.CheckingDisabled = (dh.Bits & _CD) != 0
-	m.Rcode = int(dh.Bits & 0xF)
-
-	// If we are at the end of the message we should return *just* the
-	// header. This can still be useful to the caller. 9.9.9.9 sends these
-	// when responding with REFUSED for instance.
-	if off == len(msg) {
-		// reset sections before returning
-		m.Question, m.Answer, m.Ns, m.Extra = nil, nil, nil, nil
-		return nil
-	}
-
-	// Qdcount, Ancount, Nscount, Arcount can't be trusted, as they are
-	// attacker controlled. This means we can't use them to pre-allocate
-	// slices.
-	m.Question = nil
-	for i := 0; i < int(dh.Qdcount); i++ {
-		off1 := off
-		var q dns.Question
-		q, off, err = unpackQuestion(msg, off)
-		//println("Unpack question ", q.Name, q.Qclass, q.Qtype)
-		if q.Qtype != dns.TypePTR {
-			//println("Skipping type", q.Qtype, dns.TypePTR)
-			return nil
-		}
-		if err != nil {
-			// Even if Truncated is set, we only will set ErrTruncated if we
-			// actually got the questions
-			return err
-		}
-		if off1 == off { // Offset does not increase anymore, dh.Qdcount is a lie!
-			dh.Qdcount = uint16(i)
-			break
-		}
-		m.Question = append(m.Question, q)
-	}
-
-	m.Answer, off, err = unpackRRslice(int(dh.Ancount), msg, off)
-	//// The header counts might have been wrong so we need to update it
-	dh.Ancount = uint16(len(m.Answer))
-	if err == nil {
-		m.Ns, off, err = unpackRRslice(int(dh.Nscount), msg, off)
-	}
-	//println("Answer count", dh.Ancount)
-	//// The header counts might have been wrong so we need to update it
-	//dh.Nscount = uint16(len(m.Ns))
-	//if err == nil {
-	//	m.Extra, off, err = unpackRRslice(int(dh.Arcount), msg, off)
-	//}
-	dh.Nscount = 0
-	// The header counts might have been wrong so we need to update it
-	dh.Arcount = uint16(len(m.Extra))
-
-
-	if off != len(msg) {
-		// TODO(miek) make this an error?
-		// use PackOpt to let people tell how detailed the error reporting should be?
-		// println("m: extra bytes in m packet", off, "<", len(msg))
-	} else if m.Truncated {
-		// Whether we ran into a an error or not, we want to return that it
-		// was truncated
-		err = dns.ErrTruncated
-	}
-	return err
 }
 
 // handleQuery is used to handle an incoming query
@@ -533,18 +386,13 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg) error {
 		return nil
 	}
 
-	println("Match", q.Name)
-	println("Match", q.Name, "hostname", s.service.HostName)
-	//println("Match", q.Name, "to", s.service.ServiceName())
-	//println("MatchInstance", q.Name, "to", s.service.ServiceInstanceName())
-	//println("MatchService", q.Name, "to", s.service.ServiceTypeName())
-	if (q.Name == s.service.HostName) {
-		println("Match", q.Name, "MATCHED MATCHED")
-	}
+	var name = strings.ToLower(q.Name)
 
-	switch q.Name {
+	println("Match", name, "service", s.service.ServiceName())
+	println("Match", name, "instance", s.service.ServiceInstanceName())
+
+	switch name {
 	case s.service.HostName:
-		println("Match", q.Name, "Matched to host", s.service.HostName)
 		s.composeHostAnswers(resp, s.ttl)
 	case s.service.ServiceName():
 		s.composeBrowsingAnswers(resp, s.ttl)
