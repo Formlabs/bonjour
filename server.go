@@ -541,7 +541,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32) {
 		},
 		Ptr: s.service.ServiceName(),
 	}
-	resp.Answer = append(resp.Answer, srv, txt, ptr, dnssd)
+	resp.Answer = append(resp.Answer, ptr, txt, srv, dnssd)
 
 	if s.service.AddrIPv4 != nil {
 		a := &dns.A{
@@ -567,6 +567,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32) {
 		}
 		resp.Extra = append(resp.Extra, aaaa)
 	}
+	resp.Question = make([]dns.Question, 0)
 }
 
 func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
@@ -639,8 +640,8 @@ func (s *Server) probe() {
 	//    packet loss, a responder MAY send up to eight unsolicited responses,
 	//    provided that the interval between unsolicited responses increases by
 	//    at least a factor of two with every response sent.
-	timeout := 1 * time.Second
 	for !s.shouldShutdown {
+		timeout := 1 * time.Second
 		for i := 0; i < 3 && !s.shouldShutdown; i++ {
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
