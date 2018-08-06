@@ -12,6 +12,7 @@ import (
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 var (
@@ -120,15 +121,25 @@ func newServer(iface *net.Interface) (*Server, error) {
 	}
 
 	// Join multicast groups to receive announcements
-	p1 := ipv4.NewPacketConn(ipv4conn)
-	//p2 := ipv6.NewPacketConn(ipv6conn)
+	var p1 *ipv4.PacketConn
+	var p2 *ipv6.PacketConn
+	if ipv4conn != nil {
+		p1 = ipv4.NewPacketConn(ipv4conn)
+	}
+	if ipv6conn != nil {
+		p2 = ipv6.NewPacketConn(ipv6conn)
+	}
 	if iface != nil {
-		if err := p1.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-			return nil, err
+		if p1 != nil {
+			if err := p1.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
+				return nil, err
+			}
 		}
-		//if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-		//	return nil, err
-		//}
+		if p2 != nil {
+			if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		ifaces, err := net.Interfaces()
 		if err != nil {
@@ -136,12 +147,16 @@ func newServer(iface *net.Interface) (*Server, error) {
 		}
 		errCount1, errCount2 := 0, 0
 		for _, iface := range ifaces {
-			if err := p1.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-				errCount1++
+			if p1 != nil {
+				if err := p1.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
+					errCount1++
+				}
 			}
-			//if err := p2.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-			//	errCount2++
-			//}
+			if p2 != nil {
+				if err := p2.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
+					errCount2++
+				}
+			}
 		}
 		if len(ifaces) == errCount1 && len(ifaces) == errCount2 {
 			return nil, fmt.Errorf("Failed to join multicast group on all interfaces!")
@@ -150,7 +165,7 @@ func newServer(iface *net.Interface) (*Server, error) {
 
 	s := &Server{
 		ipv4conn: ipv4conn,
-		//ipv6conn: ipv6conn,
+		ipv6conn: ipv6conn,
 		ttl: 3200,
 	}
 
