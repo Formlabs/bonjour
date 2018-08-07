@@ -5,9 +5,9 @@ import (
 	"log"
 	"math/rand"
 	"net"
-	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -41,68 +41,9 @@ var (
 	}
 )
 
-// Register a service by given arguments. This call will take the system's hostname
-// and lookup IP by that hostname.
-func Register(instance, service, domain string, port int, text []string, iface *net.Interface) (*Server, error) {
-	entry := NewServiceEntry(instance, service, domain)
-	entry.Port = port
-	entry.Text = text
-
-	if entry.Instance == "" {
-		return nil, fmt.Errorf("Missing service instance name")
-	}
-	if entry.Service == "" {
-		return nil, fmt.Errorf("Missing service name")
-	}
-	if entry.Domain == "" {
-		entry.Domain = "local"
-	}
-	if entry.Port == 0 {
-		return nil, fmt.Errorf("Missing port")
-	}
-
-	var err error
-	if entry.HostName == "" {
-		entry.HostName, err = os.Hostname()
-		if err != nil {
-			return nil, fmt.Errorf("Could not determine host")
-		}
-	}
-	entry.HostName = fmt.Sprintf("%s.", trimDot(entry.HostName))
-
-	addrs, err := net.LookupIP(entry.HostName)
-	if err != nil {
-		// Try appending the host domain suffix and lookup again
-		// (required for Linux-based hosts)
-		tmpHostName := fmt.Sprintf("%s%s.", entry.HostName, entry.Domain)
-		addrs, err = net.LookupIP(tmpHostName)
-		if err != nil {
-			return nil, fmt.Errorf("Could not determine host IP addresses for %s", entry.HostName)
-		}
-	}
-	for i := 0; i < len(addrs); i++ {
-		if ipv4 := addrs[i].To4(); ipv4 != nil {
-			entry.AddrIPv4 = addrs[i]
-		} else if ipv6 := addrs[i].To16(); ipv6 != nil {
-			entry.AddrIPv6 = addrs[i]
-		}
-	}
-
-	s, err := newServer(iface)
-	if err != nil {
-		return nil, err
-	}
-
-	s.service = entry
-	go s.mainloop()
-	go s.probe()
-
-	return s, nil
-}
-
 // Register a service proxy by given argument. This call will skip the hostname/IP lookup and
 // will use the provided values.
-func RegisterProxy(instance, service, domain string, port int, host, ip string, text []string, iface *net.Interface) (*Server, error) {
+func RegisterProxy(instance, service, domain string, port int, host string, ips []net.IP, text []string, iface *net.Interface) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -128,15 +69,16 @@ func RegisterProxy(instance, service, domain string, port int, host, ip string, 
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
 	}
 
-	ipAddr := net.ParseIP(ip)
-	if ipAddr == nil {
-		return nil, fmt.Errorf("Failed to parse given IP: %v", ip)
-	} else if ipv4 := ipAddr.To4(); ipv4 != nil {
-		entry.AddrIPv4 = ipAddr
-	} else if ipv6 := ipAddr.To16(); ipv6 != nil {
-		entry.AddrIPv4 = ipAddr
-	} else {
-		return nil, fmt.Errorf("The IP is neither IPv4 nor IPv6: %#v", ipAddr)
+	for _, ipAddr := range (ips) {
+		if ipAddr == nil {
+			return nil, fmt.Errorf("Failed to parse given IP: %v", ipAddr)
+		} else if ipv4 := ipAddr.To4(); ipv4 != nil {
+			entry.AddrsIPv4 = append(entry.AddrsIPv4, ipv4)
+		} else if ipv6 := ipAddr.To16(); ipv6 != nil {
+			entry.AddrsIPv6 = append(entry.AddrsIPv6, ipv4)
+		} else {
+			return nil, fmt.Errorf("The IP is neither IPv4 nor IPv6: %#v", ipAddr)
+		}
 	}
 
 	s, err := newServer(iface)
@@ -145,6 +87,8 @@ func RegisterProxy(instance, service, domain string, port int, host, ip string, 
 	}
 
 	s.service = entry
+	s.service.HostName = strings.ToLower(s.service.HostName)
+
 	go s.mainloop()
 	go s.probe()
 
@@ -177,14 +121,24 @@ func newServer(iface *net.Interface) (*Server, error) {
 	}
 
 	// Join multicast groups to receive announcements
-	p1 := ipv4.NewPacketConn(ipv4conn)
-	p2 := ipv6.NewPacketConn(ipv6conn)
+	var p1 *ipv4.PacketConn
+	var p2 *ipv6.PacketConn
+	if ipv4conn != nil {
+		p1 = ipv4.NewPacketConn(ipv4conn)
+	}
+	if ipv6conn != nil {
+		p2 = ipv6.NewPacketConn(ipv6conn)
+	}
 	if iface != nil {
-		if err := p1.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-			return nil, err
+		if p1 != nil {
+			if err := p1.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
+				return nil, err
+			}
 		}
-		if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-			return nil, err
+		if p2 != nil {
+			if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
+				return nil, err
+			}
 		}
 	} else {
 		ifaces, err := net.Interfaces()
@@ -193,11 +147,15 @@ func newServer(iface *net.Interface) (*Server, error) {
 		}
 		errCount1, errCount2 := 0, 0
 		for _, iface := range ifaces {
-			if err := p1.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-				errCount1++
+			if p1 != nil {
+				if err := p1.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
+					errCount1++
+				}
 			}
-			if err := p2.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-				errCount2++
+			if p2 != nil {
+				if err := p2.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
+					errCount2++
+				}
 			}
 		}
 		if len(ifaces) == errCount1 && len(ifaces) == errCount2 {
@@ -208,7 +166,7 @@ func newServer(iface *net.Interface) (*Server, error) {
 	s := &Server{
 		ipv4conn: ipv4conn,
 		ipv6conn: ipv6conn,
-		ttl:      3200,
+		ttl: 3200,
 	}
 
 	return s, nil
@@ -266,14 +224,51 @@ func (s *Server) recv(c *net.UDPConn) {
 	if c == nil {
 		return
 	}
+
+	f, _ := c.File()
+	fd, _ := syscall.Dup(int(f.Fd()))
+
+	// duplicating the fd because c.fd which holds the actual one gets garbage collected
+	e := syscall.SetNonblock(fd, true)
+	if e != nil {
+		println("Could not set nonblock", e)
+	}
+	c.SetReadBuffer(4000000)
+	if e != nil {
+		println("Could not set buffer size", e)
+	}
 	buf := make([]byte, 65536)
+
+	i := 0
+	bytes := 0
+
 	for !s.shouldShutdown {
-		n, from, err := c.ReadFrom(buf)
+		n, sa, err := syscall.Recvfrom(fd, buf, 0)
+		var from *net.UDPAddr
+		switch sa := sa.(type) {
+		case *syscall.SockaddrInet4:
+			from = &net.UDPAddr{IP: sa.Addr[0:], Port: sa.Port}
+		case *syscall.SockaddrInet6:
+			from = &net.UDPAddr{IP: sa.Addr[0:], Port: sa.Port}
+		}
+
 		if err != nil {
+			n = 0
+		}
+
+		if n == 0 {
+			time.Sleep(50 * time.Millisecond)
+			i = 0
+			bytes = 0
+
 			continue
 		}
+
+		i++
+		bytes += n
+
 		if err := s.parsePacket(buf[:n], from); err != nil {
-			log.Printf("[ERR] bonjour: Failed to handle query: %v", err)
+			//log.Printf("[ERR] bonjour: Failed to handle query: %v", err)
 		}
 	}
 }
@@ -282,7 +277,9 @@ func (s *Server) recv(c *net.UDPConn) {
 func (s *Server) parsePacket(packet []byte, from net.Addr) error {
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
-		log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
+		if err != dns.ErrTruncated {
+			log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
+		}
 		return err
 	}
 	return s.handleQuery(&msg, from)
@@ -341,7 +338,11 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg) error {
 		return nil
 	}
 
-	switch q.Name {
+	var name = strings.ToLower(q.Name)
+
+	switch name {
+	case s.service.HostName:
+		s.composeHostAnswers(resp, s.ttl)
 	case s.service.ServiceName():
 		s.composeBrowsingAnswers(resp, s.ttl)
 	case s.service.ServiceInstanceName():
@@ -351,6 +352,34 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg) error {
 	}
 
 	return nil
+}
+
+func (s *Server) composeHostAnswers(resp *dns.Msg, ttl uint32) {
+	for _, ipAddr := range s.service.AddrsIPv4 {
+		a := &dns.A{
+			Hdr: dns.RR_Header{
+				Name:   s.service.HostName,
+				Rrtype: dns.TypeA,
+				Class:  dns.ClassINET,
+				Ttl:    ttl,
+			},
+			A: ipAddr,
+		}
+		resp.Answer = append(resp.Answer, a)
+	}
+	for _, ipAddr := range s.service.AddrsIPv6 {
+		aaaa := &dns.AAAA{
+			Hdr: dns.RR_Header{
+				Name:   s.service.HostName,
+				Rrtype: dns.TypeAAAA,
+				Class:  dns.ClassINET,
+				Ttl:    ttl,
+			},
+			AAAA: ipAddr,
+		}
+		resp.Answer = append(resp.Answer, aaaa)
+	}
+	resp.Question = make([]dns.Question, 0)
 }
 
 func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
@@ -388,7 +417,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
 	}
 	resp.Extra = append(resp.Extra, srv, txt)
 
-	if s.service.AddrIPv4 != nil {
+	for _, ipAddr := range s.service.AddrsIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
 				Name:   s.service.HostName,
@@ -396,11 +425,11 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
 				Class:  dns.ClassINET,
 				Ttl:    ttl,
 			},
-			A: s.service.AddrIPv4,
+			A: ipAddr,
 		}
 		resp.Extra = append(resp.Extra, a)
 	}
-	if s.service.AddrIPv6 != nil {
+	for _, ipAddr := range s.service.AddrsIPv6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
 				Name:   s.service.HostName,
@@ -408,7 +437,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
 				Class:  dns.ClassINET,
 				Ttl:    ttl,
 			},
-			AAAA: s.service.AddrIPv6,
+			AAAA: ipAddr,
 		}
 		resp.Extra = append(resp.Extra, aaaa)
 	}
@@ -460,32 +489,33 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32) {
 		},
 		Ptr: s.service.ServiceName(),
 	}
-	resp.Answer = append(resp.Answer, srv, txt, ptr, dnssd)
+	resp.Answer = append(resp.Answer, ptr, txt, srv, dnssd)
 
-	if s.service.AddrIPv4 != nil {
+	for _, ipAddr := range s.service.AddrsIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
 				Name:   s.service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cache_flush,
-				Ttl:    120,
+				Class:  dns.ClassINET,
+				Ttl:    ttl,
 			},
-			A: s.service.AddrIPv4,
+			A: ipAddr,
 		}
 		resp.Extra = append(resp.Extra, a)
 	}
-	if s.service.AddrIPv6 != nil {
+	for _, ipAddr := range s.service.AddrsIPv6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
 				Name:   s.service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cache_flush,
-				Ttl:    120,
+				Class:  dns.ClassINET,
+				Ttl:    ttl,
 			},
-			AAAA: s.service.AddrIPv6,
+			AAAA: ipAddr,
 		}
 		resp.Extra = append(resp.Extra, aaaa)
 	}
+	resp.Question = make([]dns.Question, 0)
 }
 
 func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
@@ -558,13 +588,15 @@ func (s *Server) probe() {
 	//    packet loss, a responder MAY send up to eight unsolicited responses,
 	//    provided that the interval between unsolicited responses increases by
 	//    at least a factor of two with every response sent.
-	timeout := 1 * time.Second
-	for i := 0; i < 3; i++ {
-		if err := s.multicastResponse(resp); err != nil {
-			log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
+	for !s.shouldShutdown {
+		timeout := 1 * time.Second
+		for i := 0; i < 3 && !s.shouldShutdown; i++ {
+			if err := s.multicastResponse(resp); err != nil {
+				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
+			}
+			time.Sleep(timeout)
+			timeout *= 2
 		}
-		time.Sleep(timeout)
-		timeout *= 2
 	}
 }
 

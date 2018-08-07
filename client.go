@@ -202,14 +202,14 @@ func (c *client) mainloop(params *LookupParams) {
 					entries[rr.Hdr.Name].TTL = rr.Hdr.Ttl
 				case *dns.A:
 					for k, e := range entries {
-						if e.HostName == rr.Hdr.Name && entries[k].AddrIPv4 == nil {
-							entries[k].AddrIPv4 = rr.A
+						if e.HostName == rr.Hdr.Name {
+							entries[k].AddrsIPv4 = append(entries[k].AddrsIPv4, rr.A)
 						}
 					}
 				case *dns.AAAA:
 					for k, e := range entries {
-						if e.HostName == rr.Hdr.Name && entries[k].AddrIPv6 == nil {
-							entries[k].AddrIPv6 = rr.AAAA
+						if e.HostName == rr.Hdr.Name {
+							entries[k].AddrsIPv6 = append(entries[k].AddrsIPv6, rr.AAAA)
 						}
 					}
 				}
