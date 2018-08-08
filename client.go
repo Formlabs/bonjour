@@ -9,7 +9,7 @@ import (
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
-	"github.com/miekg/dns"
+	"github.com/Formlabs/dns"
 )
 
 // Main client data structure to run browse/lookup queries

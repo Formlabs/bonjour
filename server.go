@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/miekg/dns"
+	"github.com/Formlabs/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
