@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,7 +70,7 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
 	}
 
-	for _, ipAddr := range (ips) {
+	for _, ipAddr := range ips {
 		if ipAddr == nil {
 			return nil, fmt.Errorf("Failed to parse given IP: %v", ipAddr)
 		} else if ipv4 := ipAddr.To4(); ipv4 != nil {
@@ -86,8 +87,8 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		return nil, err
 	}
 
-	s.service = entry
-	s.service.HostName = strings.ToLower(s.service.HostName)
+	entry.HostName = strings.ToLower(entry.HostName)
+	s.SetServiceEntry(entry)
 
 	go s.mainloop()
 	go s.probe()
@@ -97,12 +98,20 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 
 // Server structure incapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	service        *ServiceEntry
 	ipv4conn       *net.UDPConn
 	ipv6conn       *net.UDPConn
 	shouldShutdown bool
 	shutdownLock   sync.Mutex
 	ttl            uint32
+	serviceEntry   atomic.Value
+}
+
+func (s *Server) SetServiceEntry(newEntry *ServiceEntry) {
+	s.serviceEntry.Store(newEntry)
+}
+
+func (s *Server) GetServiceEntry() *ServiceEntry {
+	return s.serviceEntry.Load().(*ServiceEntry)
 }
 
 // Constructs server structure
@@ -185,12 +194,6 @@ func (s *Server) mainloop() {
 // Shutdown closes all udp connections and unregisters the service
 func (s *Server) Shutdown() {
 	s.shutdown()
-}
-
-// SetText updates and announces the TXT records
-func (s *Server) SetText(text []string) {
-	s.service.Text = text
-	s.announceText()
 }
 
 // TTL sets the TTL for DNS replies
@@ -334,45 +337,54 @@ func (s *Server) handleQuery(query *dns.Msg, from net.Addr) error {
 
 // handleQuestion is used to handle an incoming question
 func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg) error {
-	if s.service == nil {
+	service := s.GetServiceEntry()
+
+	if service == nil {
 		return nil
 	}
 
 	var name = strings.ToLower(q.Name)
 
 	switch name {
-	case s.service.HostName:
-		s.composeHostAnswers(resp, s.ttl)
-	case s.service.ServiceName():
-		s.composeBrowsingAnswers(resp, s.ttl)
-	case s.service.ServiceInstanceName():
-		s.composeLookupAnswers(resp, s.ttl)
-	case s.service.ServiceTypeName():
-		s.serviceTypeName(resp, s.ttl)
+	case service.HostName:
+		s.composeHostAnswers(isUnicastQuestion(q), resp, s.ttl)
+	//case s.service.ServiceName():
+	//	s.composeBrowsingAnswers(q, resp, s.ttl)
+	//case s.service.ServiceInstanceName():
+	//	s.composeLookupAnswers(q, resp, s.ttl)
+	//case s.service.ServiceTypeName():
+	//	s.serviceTypeName(q, resp, s.ttl)
 	}
 
 	return nil
 }
 
-func (s *Server) composeHostAnswers(resp *dns.Msg, ttl uint32) {
-	for _, ipAddr := range s.service.AddrsIPv4 {
+func (s *Server) composeHostAnswers(useCacheFlush bool, resp *dns.Msg, ttl uint32) {
+	cacheFlush := uint16(1 << 15)
+	if !useCacheFlush {
+		cacheFlush = 0
+	}
+
+	service := s.GetServiceEntry()
+
+	for _, ipAddr := range service.AddrsIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET,
+				Class:  dns.ClassINET | cacheFlush,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
 		}
 		resp.Answer = append(resp.Answer, a)
 	}
-	for _, ipAddr := range s.service.AddrsIPv6 {
+	for _, ipAddr := range service.AddrsIPv6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET,
+				Class:  dns.ClassINET | cacheFlush,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
@@ -382,59 +394,66 @@ func (s *Server) composeHostAnswers(resp *dns.Msg, ttl uint32) {
 	resp.Question = make([]dns.Question, 0)
 }
 
-func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
+func (s *Server) composeBrowsingAnswers(useCacheFlush bool, resp *dns.Msg, ttl uint32) {
+	cacheFlush := uint16(1 << 15)
+	if !useCacheFlush {
+		cacheFlush = 0
+	}
+
+	service := s.GetServiceEntry()
+
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceName(),
+			Name:   service.ServiceName(),
 			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET,
+			Class:  dns.ClassINET | cacheFlush,
 			Ttl:    ttl,
 		},
-		Ptr: s.service.ServiceInstanceName(),
+		Ptr: service.ServiceInstanceName(),
 	}
 	resp.Answer = append(resp.Answer, ptr)
 
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET,
+			Class:  dns.ClassINET | cacheFlush,
 			Ttl:    ttl,
 		},
-		Txt: s.service.Text,
+		Txt: service.Text,
 	}
 	srv := &dns.SRV{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET,
+			Class:  dns.ClassINET | cacheFlush,
 			Ttl:    ttl,
 		},
 		Priority: 0,
 		Weight:   0,
-		Port:     uint16(s.service.Port),
-		Target:   s.service.HostName,
+		Port:     uint16(service.Port),
+		Target:   service.HostName,
 	}
 	resp.Extra = append(resp.Extra, srv, txt)
 
-	for _, ipAddr := range s.service.AddrsIPv4 {
+	for _, ipAddr := range service.AddrsIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET,
+				Class:  dns.ClassINET | cacheFlush,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
 		}
 		resp.Extra = append(resp.Extra, a)
 	}
-	for _, ipAddr := range s.service.AddrsIPv6 {
+	for _, ipAddr := range service.AddrsIPv6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET,
+				Class:  dns.ClassINET | cacheFlush,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
@@ -443,72 +462,78 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ttl uint32) {
 	}
 }
 
-func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32) {
+func (s *Server) composeLookupAnswers(useCacheFlush bool, resp *dns.Msg, ttl uint32) {
 	// From RFC6762
 	//    The most significant bit of the rrclass for a record in the Answer
 	//    Section of a response message is the Multicast DNS cache-flush bit
 	//    and is discussed in more detail below in Section 10.2, "Announcements
 	//    to Flush Outdated Cache Entries".
-	cache_flush := uint16(1 << 15)
+	cacheFlush := uint16(1 << 15)
+	if !useCacheFlush {
+		cacheFlush = 0
+	}
+
+	service := s.GetServiceEntry()
+
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceName(),
+			Name:   service.ServiceName(),
 			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET,
+			Class:  dns.ClassINET | cacheFlush,
 			Ttl:    ttl,
 		},
-		Ptr: s.service.ServiceInstanceName(),
+		Ptr: service.ServiceInstanceName(),
 	}
 	srv := &dns.SRV{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET | cache_flush,
+			Class:  dns.ClassINET | cacheFlush,
 			Ttl:    ttl,
 		},
 		Priority: 0,
 		Weight:   0,
-		Port:     uint16(s.service.Port),
-		Target:   s.service.HostName,
+		Port:     uint16(service.Port),
+		Target:   service.HostName,
 	}
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET | cache_flush,
+			Class:  dns.ClassINET | cacheFlush,
 			Ttl:    ttl,
 		},
-		Txt: s.service.Text,
+		Txt: service.Text,
 	}
 	dnssd := &dns.PTR{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceTypeName(),
+			Name:   service.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
-		Ptr: s.service.ServiceName(),
+		Ptr: service.ServiceName(),
 	}
 	resp.Answer = append(resp.Answer, ptr, txt, srv, dnssd)
 
-	for _, ipAddr := range s.service.AddrsIPv4 {
+	for _, ipAddr := range service.AddrsIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET,
+				Class:  dns.ClassINET | cacheFlush,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
 		}
 		resp.Extra = append(resp.Extra, a)
 	}
-	for _, ipAddr := range s.service.AddrsIPv6 {
+	for _, ipAddr := range service.AddrsIPv6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET,
+				Class:  dns.ClassINET | cacheFlush,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
@@ -519,6 +544,8 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32) {
 }
 
 func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
+	service := s.GetServiceEntry()
+
 	// From RFC6762
 	// 9.  Service Type Enumeration
 	//
@@ -529,12 +556,12 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 	//    "_http._tcp.<Domain>".
 	dnssd := &dns.PTR{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceTypeName(),
+			Name:   service.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
-		Ptr: s.service.ServiceName(),
+		Ptr: service.ServiceName(),
 	}
 	resp.Answer = append(resp.Answer, dnssd)
 }
@@ -542,30 +569,32 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 // Perform probing & announcement
 //TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
+	service := s.GetServiceEntry()
+
 	q := new(dns.Msg)
-	q.SetQuestion(s.service.ServiceInstanceName(), dns.TypePTR)
+	q.SetQuestion(service.ServiceInstanceName(), dns.TypePTR)
 	q.RecursionDesired = false
 
 	srv := &dns.SRV{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
 			Class:  dns.ClassINET,
 			Ttl:    s.ttl,
 		},
 		Priority: 0,
 		Weight:   0,
-		Port:     uint16(s.service.Port),
-		Target:   s.service.HostName,
+		Port:     uint16(service.Port),
+		Target:   service.HostName,
 	}
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET,
 			Ttl:    s.ttl,
 		},
-		Txt: s.service.Text,
+		Txt: service.Text,
 	}
 	q.Ns = []dns.RR{srv, txt}
 
@@ -580,7 +609,7 @@ func (s *Server) probe() {
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, s.ttl)
+	s.composeLookupAnswers(true, resp, s.ttl)
 
 	// From RFC6762
 	//    The Multicast DNS responder MUST send at least two unsolicited
@@ -591,6 +620,7 @@ func (s *Server) probe() {
 	for !s.shouldShutdown {
 		timeout := 1 * time.Second
 		for i := 0; i < 3 && !s.shouldShutdown; i++ {
+			log.Println("Unsolicited", resp)
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
 			}
@@ -602,17 +632,19 @@ func (s *Server) probe() {
 
 // announceText sends a Text announcement with cache flush enabled
 func (s *Server) announceText() {
+	service := s.GetServiceEntry()
+
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
 
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET | 1<<15,
 			Ttl:    s.ttl,
 		},
-		Txt: s.service.Text,
+		Txt: service.Text,
 	}
 
 	resp.Answer = []dns.RR{txt}
@@ -624,7 +656,7 @@ func (s *Server) unregister() error {
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, 0)
+	s.composeLookupAnswers(true, resp, 0)
 	return s.multicastResponse(resp)
 }
 
@@ -647,6 +679,7 @@ func (s *Server) unicastResponse(resp *dns.Msg, from net.Addr) error {
 // multicastResponse us used to send a multicast response packet
 func (c *Server) multicastResponse(msg *dns.Msg) error {
 	buf, err := msg.Pack()
+	//log.Println("Sending out multicast", msg)
 	if err != nil {
 		log.Println("Failed to pack message!")
 		return err
