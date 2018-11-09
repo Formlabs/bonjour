@@ -6,7 +6,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,9 +40,8 @@ var (
 	}
 )
 
-// Register a service proxy by given argument. This call will skip the hostname/IP lookup and
-// will use the provided values.
-func RegisterProxy(instance, service, domain string, port int, host string, ips []net.IP, text []string, iface *net.Interface) (*Server, error) {
+func MakeServiceEntry(instance, service, domain string,
+	port int, host string, ips []net.IP, text []string) (*ServiceEntry, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -81,16 +79,21 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		}
 	}
 
-	s, err := newServer(iface)
+	entry.HostName = strings.ToLower(entry.HostName)
+
+	return entry, nil
+}
+
+// Register a service proxy by given argument. This call will skip the hostname/IP lookup and
+// will use the provided values.
+func RegisterProxy(initialEntry *ServiceEntry, entries chan *ServiceEntry, iface *net.Interface) (*Server, error) {
+	s, err := newServer(initialEntry, iface)
 	if err != nil {
 		return nil, err
 	}
 
-	entry.HostName = strings.ToLower(entry.HostName)
-	s.SetServiceEntry(entry)
-
 	s.waitGroup.Add(1)
-	go s.mainloop()
+	go s.mainloop(entries)
 
 	return s, nil
 }
@@ -99,25 +102,17 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 type Server struct {
 	ipv4conn          *net.UDPConn
 	ipv6conn          *net.UDPConn
+	initialEntry      *ServiceEntry
 	shouldShutdown    bool
 	shutdownChan      chan bool
 	shutdownChanProbe chan bool
 	waitGroup         sync.WaitGroup
 	shutdownLock      sync.Mutex
 	ttl               uint32
-	serviceEntry      atomic.Value
-}
-
-func (s *Server) SetServiceEntry(newEntry *ServiceEntry) {
-	s.serviceEntry.Store(newEntry)
-}
-
-func (s *Server) GetServiceEntry() *ServiceEntry {
-	return s.serviceEntry.Load().(*ServiceEntry)
 }
 
 // Constructs server structure
-func newServer(iface *net.Interface) (*Server, error) {
+func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error) {
 	// Create wildcard connections (because :5353 can be already taken by other apps)
 	ipv4conn, err := net.ListenUDP("udp4", mdnsWildcardAddrIPv4)
 	if err != nil {
@@ -179,6 +174,7 @@ func newServer(iface *net.Interface) (*Server, error) {
 		ipv6conn:     ipv6conn,
 		ttl:          3200,
 		shutdownChan: make(chan bool),
+		initialEntry: initialEntry,
 	}
 
 	return s, nil
@@ -196,7 +192,9 @@ func (s *Server) TTL(ttl uint32) {
 }
 
 // Start listeners and waits for the shutdown signal from exit channel
-func (s *Server) mainloop() {
+func (s *Server) mainloop(entries chan *ServiceEntry) {
+	entry := s.initialEntry
+
 	defer s.waitGroup.Done()
 
 	requests := make(chan *Request, 5)
@@ -223,7 +221,7 @@ func (s *Server) mainloop() {
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(true, resp, s.ttl)
+	s.composeLookupAnswers(entry, true, resp, s.ttl)
 
 	i := 0
 
@@ -232,6 +230,9 @@ func (s *Server) mainloop() {
 		case <-s.shutdownChan:
 			ticker.Stop()
 			return
+
+		case entry = <-entries:
+			break
 
 		case <-ticker.C:
 			i++
@@ -250,7 +251,7 @@ func (s *Server) mainloop() {
 
 
 		case req := <-requests:
-			s.handleQuery(req)
+			s.handleQuery(entry, req)
 		}
 	}
 }
@@ -260,7 +261,7 @@ func (s *Server) shutdown() error {
 	s.shutdownLock.Lock()
 	defer s.shutdownLock.Unlock()
 
-	s.unregister()
+	s.unregister(s.initialEntry)
 
 	if s.shouldShutdown {
 		return nil
@@ -362,7 +363,7 @@ func (s *Server) parsePacket(packet []byte, from net.Addr) (*Request, error) {
 }
 
 // handleQuery is used to handle an incoming query
-func (s *Server) handleQuery(request *Request) error {
+func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 	// Ignore answer for now
 	if len(request.query.Answer) > 0 {
 		return nil
@@ -383,7 +384,7 @@ func (s *Server) handleQuery(request *Request) error {
 			resp.SetReply(&request.query)
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
-			if err = s.handleQuestion(q, &resp); err != nil {
+			if err = s.handleQuestion(q, service, &resp); err != nil {
 				log.Printf("[ERR] bonjour: failed to handle question %v: %v",
 					q, err)
 				continue
@@ -409,9 +410,7 @@ func (s *Server) handleQuery(request *Request) error {
 }
 
 // handleQuestion is used to handle an incoming question
-func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg) error {
-	service := s.GetServiceEntry()
-
+func (s *Server) handleQuestion(q dns.Question, service *ServiceEntry, resp *dns.Msg) error {
 	if service == nil {
 		return nil
 	}
@@ -420,25 +419,23 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg) error {
 
 	switch name {
 	case service.HostName:
-		s.composeHostAnswers(isUnicastQuestion(q), resp, s.ttl)
-		//case s.service.ServiceName():
-		//	s.composeBrowsingAnswers(q, resp, s.ttl)
-		//case s.service.ServiceInstanceName():
-		//	s.composeLookupAnswers(q, resp, s.ttl)
-		//case s.service.ServiceTypeName():
-		//	s.serviceTypeName(q, resp, s.ttl)
+		s.composeHostAnswers(service, isUnicastQuestion(q), resp, s.ttl)
+	case service.ServiceName():
+		s.composeBrowsingAnswers(service, isUnicastQuestion(q), resp, s.ttl)
+	case service.ServiceInstanceName():
+		s.composeLookupAnswers(service, isUnicastQuestion(q), resp, s.ttl)
+	case service.ServiceTypeName():
+		s.serviceTypeName(service, isUnicastQuestion(q), resp, s.ttl)
 	}
 
 	return nil
 }
 
-func (s *Server) composeHostAnswers(useCacheFlush bool, resp *dns.Msg, ttl uint32) {
+func (s *Server) composeHostAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
 	cacheFlush := uint16(1 << 15)
 	if !useCacheFlush {
 		cacheFlush = 0
 	}
-
-	service := s.GetServiceEntry()
 
 	for _, ipAddr := range service.AddrsIPv4 {
 		a := &dns.A{
@@ -467,13 +464,11 @@ func (s *Server) composeHostAnswers(useCacheFlush bool, resp *dns.Msg, ttl uint3
 	resp.Question = make([]dns.Question, 0)
 }
 
-func (s *Server) composeBrowsingAnswers(useCacheFlush bool, resp *dns.Msg, ttl uint32) {
+func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
 	cacheFlush := uint16(1 << 15)
 	if !useCacheFlush {
 		cacheFlush = 0
 	}
-
-	service := s.GetServiceEntry()
 
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
@@ -535,7 +530,7 @@ func (s *Server) composeBrowsingAnswers(useCacheFlush bool, resp *dns.Msg, ttl u
 	}
 }
 
-func (s *Server) composeLookupAnswers(useCacheFlush bool, resp *dns.Msg, ttl uint32) {
+func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
 	// From RFC6762
 	//    The most significant bit of the rrclass for a record in the Answer
 	//    Section of a response message is the Multicast DNS cache-flush bit
@@ -545,8 +540,6 @@ func (s *Server) composeLookupAnswers(useCacheFlush bool, resp *dns.Msg, ttl uin
 	if !useCacheFlush {
 		cacheFlush = 0
 	}
-
-	service := s.GetServiceEntry()
 
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
@@ -616,9 +609,11 @@ func (s *Server) composeLookupAnswers(useCacheFlush bool, resp *dns.Msg, ttl uin
 	resp.Question = make([]dns.Question, 0)
 }
 
-func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
-	service := s.GetServiceEntry()
-
+func (s *Server) serviceTypeName(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
+	cacheFlush := uint16(1 << 15)
+	if !useCacheFlush {
+		cacheFlush = 0
+	}
 	// From RFC6762
 	// 9.  Service Type Enumeration
 	//
@@ -631,7 +626,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET,
+			Class:  dns.ClassINET | cacheFlush,
 			Ttl:    ttl,
 		},
 		Ptr: service.ServiceName(),
@@ -640,9 +635,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 }
 
 // announceText sends a Text announcement with cache flush enabled
-func (s *Server) announceText() {
-	service := s.GetServiceEntry()
-
+func (s *Server) announceText(service *ServiceEntry) {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
 
@@ -660,12 +653,12 @@ func (s *Server) announceText() {
 	s.multicastResponse(resp)
 }
 
-func (s *Server) unregister() error {
+func (s *Server) unregister(service *ServiceEntry) error {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(true, resp, 0)
+	s.composeLookupAnswers(service, true, resp, 0)
 	return s.multicastResponse(resp)
 }
 
