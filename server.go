@@ -3,7 +3,6 @@ package bonjour
 import (
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -90,10 +89,8 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 	entry.HostName = strings.ToLower(entry.HostName)
 	s.SetServiceEntry(entry)
 
-	//s.waitGroup.Add(1)
-	//go s.mainloop()
 	s.waitGroup.Add(1)
-	go s.probe()
+	go s.mainloop()
 
 	return s, nil
 }
@@ -213,13 +210,46 @@ func (s *Server) mainloop() {
 		go s.recv(s.ipv6conn, requests)
 	}
 
+	// From RFC6762
+	//    The Multicast DNS responder MUST send at least two unsolicited
+	//    responses, one second apart. To provide increased robustness against
+	//    packet loss, a responder MAY send up to eight unsolicited responses,
+	//    provided that the interval between unsolicited responses increases by
+	//    at least a factor of two with every response sent.
+	timeout := 1 * time.Second
+	ticker := time.NewTicker(timeout)
+
+	resp := new(dns.Msg)
+	resp.MsgHdr.Response = true
+	resp.Answer = []dns.RR{}
+	resp.Extra = []dns.RR{}
+	s.composeLookupAnswers(true, resp, s.ttl)
+
+	i := 0
+
 	for {
 		select {
 		case <-s.shutdownChan:
+			ticker.Stop()
 			return
 
+		case <-ticker.C:
+			i++
+			if i > 3 {
+				timeout = 1 * time.Second
+				i = 0
+			}
+
+			if err := s.multicastResponse(resp); err != nil {
+				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
+			}
+			ticker.Stop()
+			ticker = time.NewTicker(timeout)
+			timeout *= 2
+			break
+
+
 		case req := <-requests:
-			log.Println("Got req", req)
 			s.handleQuery(req)
 		}
 	}
@@ -251,107 +281,6 @@ func (s *Server) shutdown() error {
 	s.waitGroup.Wait()
 
 	return nil
-}
-
-// Perform probing & announcement
-//TODO: implement a proper probing & conflict resolution
-func (s *Server) probe() {
-	defer s.waitGroup.Done()
-
-	service := s.GetServiceEntry()
-
-	q := new(dns.Msg)
-	q.SetQuestion(service.ServiceInstanceName(), dns.TypePTR)
-	q.RecursionDesired = false
-
-	srv := &dns.SRV{
-		Hdr: dns.RR_Header{
-			Name:   service.ServiceInstanceName(),
-			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Priority: 0,
-		Weight:   0,
-		Port:     uint16(service.Port),
-		Target:   service.HostName,
-	}
-	txt := &dns.TXT{
-		Hdr: dns.RR_Header{
-			Name:   service.ServiceInstanceName(),
-			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Txt: service.Text,
-	}
-	q.Ns = []dns.RR{srv, txt}
-
-	ticker := time.NewTicker(1 * time.Millisecond)
-	randomizer := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	i := 0
-	L:
-	for {
-		select {
-		case <-ticker.C:
-			i++
-			if i > 3 {
-				break L
-			}
-			log.Println("probe", q)
-			if err := s.multicastResponse(q); err != nil {
-				log.Println("[ERR] bonjour: failed to send probe:", err.Error())
-			}
-			ticker.Stop()
-			ticker = time.NewTicker(time.Duration(randomizer.Intn(250)) * time.Millisecond)
-			break
-
-		case <-s.shutdownChanProbe:
-			ticker.Stop()
-			return
-		}
-	}
-
-	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
-	resp.Answer = []dns.RR{}
-	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(true, resp, s.ttl)
-
-	i = 0
-
-	// From RFC6762
-	//    The Multicast DNS responder MUST send at least two unsolicited
-	//    responses, one second apart. To provide increased robustness against
-	//    packet loss, a responder MAY send up to eight unsolicited responses,
-	//    provided that the interval between unsolicited responses increases by
-	//    at least a factor of two with every response sent.
-	timeout := 1 * time.Second
-	ticker = time.NewTicker(timeout)
-	for {
-		select {
-		case <-ticker.C:
-			i++
-			if i > 3 {
-				timeout = 1 * time.Second
-				i = 0
-			}
-
-			log.Println("announce", resp)
-			if err := s.multicastResponse(resp); err != nil {
-				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
-			}
-			ticker.Stop()
-			ticker = time.NewTicker(timeout)
-			timeout *= 2
-			break
-
-		case <-s.shutdownChanProbe:
-			ticker.Stop()
-			return
-		}
-	}
 }
 
 type Request struct {
