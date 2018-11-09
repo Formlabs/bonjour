@@ -90,7 +90,9 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 	entry.HostName = strings.ToLower(entry.HostName)
 	s.SetServiceEntry(entry)
 
+	s.waitGroup.Add(1)
 	go s.mainloop()
+	s.waitGroup.Add(1)
 	go s.probe()
 
 	return s, nil
@@ -98,12 +100,15 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 
 // Server structure incapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	ipv4conn       *net.UDPConn
-	ipv6conn       *net.UDPConn
-	shouldShutdown bool
-	shutdownLock   sync.Mutex
-	ttl            uint32
-	serviceEntry   atomic.Value
+	ipv4conn          *net.UDPConn
+	ipv6conn          *net.UDPConn
+	shouldShutdown    bool
+	shutdownChan      chan bool
+	shutdownChanProbe chan bool
+	waitGroup         sync.WaitGroup
+	shutdownLock      sync.Mutex
+	ttl               uint32
+	serviceEntry      atomic.Value
 }
 
 func (s *Server) SetServiceEntry(newEntry *ServiceEntry) {
@@ -173,32 +178,51 @@ func newServer(iface *net.Interface) (*Server, error) {
 	}
 
 	s := &Server{
-		ipv4conn: ipv4conn,
-		ipv6conn: ipv6conn,
-		ttl: 3200,
+		ipv4conn:     ipv4conn,
+		ipv6conn:     ipv6conn,
+		ttl:          3200,
+		shutdownChan: make(chan bool),
 	}
 
 	return s, nil
 }
 
-// Start listeners and waits for the shutdown signal from exit channel
-func (s *Server) mainloop() {
-	if s.ipv4conn != nil {
-		go s.recv(s.ipv4conn)
-	}
-	if s.ipv6conn != nil {
-		go s.recv(s.ipv6conn)
-	}
-}
-
 // Shutdown closes all udp connections and unregisters the service
 func (s *Server) Shutdown() {
+	log.Println("Shutting down")
 	s.shutdown()
 }
 
 // TTL sets the TTL for DNS replies
 func (s *Server) TTL(ttl uint32) {
 	s.ttl = ttl
+}
+
+// Start listeners and waits for the shutdown signal from exit channel
+func (s *Server) mainloop() {
+	defer s.waitGroup.Done()
+
+	requests := make(chan *Request, 5)
+
+	if s.ipv4conn != nil {
+		s.waitGroup.Add(1)
+		go s.recv(s.ipv4conn, requests)
+	}
+	if s.ipv6conn != nil {
+		s.waitGroup.Add(1)
+		go s.recv(s.ipv6conn, requests)
+	}
+
+	for {
+		select {
+		case <-s.shutdownChan:
+			return
+
+		case req := <-requests:
+			log.Println("Got req", req)
+			s.handleQuery(req)
+		}
+	}
 }
 
 // Shutdown server will close currently open connections & channel
@@ -213,17 +237,97 @@ func (s *Server) shutdown() error {
 	}
 	s.shouldShutdown = true
 
+	s.shutdownChan <- true
+	//s.shutdownChanProbe <- true
+
 	if s.ipv4conn != nil {
 		s.ipv4conn.Close()
 	}
 	if s.ipv6conn != nil {
 		s.ipv6conn.Close()
 	}
+
+	log.Println("Waiting for goroutines to finish")
+	s.waitGroup.Wait()
+
 	return nil
 }
 
+// Perform probing & announcement
+//TODO: implement a proper probing & conflict resolution
+func (s *Server) probe() {
+	defer s.waitGroup.Done()
+
+	service := s.GetServiceEntry()
+
+	q := new(dns.Msg)
+	q.SetQuestion(service.ServiceInstanceName(), dns.TypePTR)
+	q.RecursionDesired = false
+
+	srv := &dns.SRV{
+		Hdr: dns.RR_Header{
+			Name:   service.ServiceInstanceName(),
+			Rrtype: dns.TypeSRV,
+			Class:  dns.ClassINET,
+			Ttl:    s.ttl,
+		},
+		Priority: 0,
+		Weight:   0,
+		Port:     uint16(service.Port),
+		Target:   service.HostName,
+	}
+	txt := &dns.TXT{
+		Hdr: dns.RR_Header{
+			Name:   service.ServiceInstanceName(),
+			Rrtype: dns.TypeTXT,
+			Class:  dns.ClassINET,
+			Ttl:    s.ttl,
+		},
+		Txt: service.Text,
+	}
+	q.Ns = []dns.RR{srv, txt}
+
+	randomizer := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < 3; i++ {
+		if err := s.multicastResponse(q); err != nil {
+			log.Println("[ERR] bonjour: failed to send probe:", err.Error())
+		}
+		time.Sleep(time.Duration(randomizer.Intn(250)) * time.Millisecond)
+	}
+	resp := new(dns.Msg)
+	resp.MsgHdr.Response = true
+	resp.Answer = []dns.RR{}
+	resp.Extra = []dns.RR{}
+	s.composeLookupAnswers(true, resp, s.ttl)
+
+	// From RFC6762
+	//    The Multicast DNS responder MUST send at least two unsolicited
+	//    responses, one second apart. To provide increased robustness against
+	//    packet loss, a responder MAY send up to eight unsolicited responses,
+	//    provided that the interval between unsolicited responses increases by
+	//    at least a factor of two with every response sent.
+	for !s.shouldShutdown {
+		timeout := 1 * time.Second
+		for i := 0; i < 3 && !s.shouldShutdown; i++ {
+			log.Println("Unsolicited", resp)
+			if err := s.multicastResponse(resp); err != nil {
+				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
+			}
+			time.Sleep(timeout)
+			timeout *= 2
+		}
+	}
+}
+
+type Request struct {
+	from  net.Addr
+	query dns.Msg
+}
+
 // recv is a long running routine to receive packets from an interface
-func (s *Server) recv(c *net.UDPConn) {
+func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
+	defer s.waitGroup.Done()
+
 	if c == nil {
 		return
 	}
@@ -270,32 +374,37 @@ func (s *Server) recv(c *net.UDPConn) {
 		i++
 		bytes += n
 
-		if err := s.parsePacket(buf[:n], from); err != nil {
+		request, err := s.parsePacket(buf[:n], from)
+		if err != nil {
 			//log.Printf("[ERR] bonjour: Failed to handle query: %v", err)
+		} else {
+			requests <- request
 		}
 	}
 }
 
 // parsePacket is used to parse an incoming packet
-func (s *Server) parsePacket(packet []byte, from net.Addr) error {
-	var msg dns.Msg
-	if err := msg.Unpack(packet); err != nil {
+func (s *Server) parsePacket(packet []byte, from net.Addr) (*Request, error) {
+	var request Request
+	request.from = from
+	if err := request.query.Unpack(packet); err != nil {
 		if err != dns.ErrTruncated {
 			log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
 		}
-		return err
+		return nil, err
+	} else {
+		return &request, nil
 	}
-	return s.handleQuery(&msg, from)
 }
 
 // handleQuery is used to handle an incoming query
-func (s *Server) handleQuery(query *dns.Msg, from net.Addr) error {
+func (s *Server) handleQuery(request *Request) error {
 	// Ignore answer for now
-	if len(query.Answer) > 0 {
+	if len(request.query.Answer) > 0 {
 		return nil
 	}
 	// Ignore questions with Authorative section for now
-	if len(query.Ns) > 0 {
+	if len(request.query.Ns) > 0 {
 		return nil
 	}
 
@@ -304,10 +413,10 @@ func (s *Server) handleQuery(query *dns.Msg, from net.Addr) error {
 		resp dns.Msg
 		err  error
 	)
-	if len(query.Question) > 0 {
-		for _, q := range query.Question {
+	if len(request.query.Question) > 0 {
+		for _, q := range request.query.Question {
 			resp = dns.Msg{}
-			resp.SetReply(query)
+			resp.SetReply(&request.query)
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 			if err = s.handleQuestion(q, &resp); err != nil {
@@ -319,7 +428,7 @@ func (s *Server) handleQuery(query *dns.Msg, from net.Addr) error {
 			if len(resp.Answer) > 0 {
 				if isUnicastQuestion(q) {
 					// Send unicast
-					if e := s.unicastResponse(&resp, from); e != nil {
+					if e := s.unicastResponse(&resp, request.from); e != nil {
 						err = e
 					}
 				} else {
@@ -348,12 +457,12 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg) error {
 	switch name {
 	case service.HostName:
 		s.composeHostAnswers(isUnicastQuestion(q), resp, s.ttl)
-	//case s.service.ServiceName():
-	//	s.composeBrowsingAnswers(q, resp, s.ttl)
-	//case s.service.ServiceInstanceName():
-	//	s.composeLookupAnswers(q, resp, s.ttl)
-	//case s.service.ServiceTypeName():
-	//	s.serviceTypeName(q, resp, s.ttl)
+		//case s.service.ServiceName():
+		//	s.composeBrowsingAnswers(q, resp, s.ttl)
+		//case s.service.ServiceInstanceName():
+		//	s.composeLookupAnswers(q, resp, s.ttl)
+		//case s.service.ServiceTypeName():
+		//	s.serviceTypeName(q, resp, s.ttl)
 	}
 
 	return nil
@@ -566,70 +675,6 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 	resp.Answer = append(resp.Answer, dnssd)
 }
 
-// Perform probing & announcement
-//TODO: implement a proper probing & conflict resolution
-func (s *Server) probe() {
-	service := s.GetServiceEntry()
-
-	q := new(dns.Msg)
-	q.SetQuestion(service.ServiceInstanceName(), dns.TypePTR)
-	q.RecursionDesired = false
-
-	srv := &dns.SRV{
-		Hdr: dns.RR_Header{
-			Name:   service.ServiceInstanceName(),
-			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Priority: 0,
-		Weight:   0,
-		Port:     uint16(service.Port),
-		Target:   service.HostName,
-	}
-	txt := &dns.TXT{
-		Hdr: dns.RR_Header{
-			Name:   service.ServiceInstanceName(),
-			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Txt: service.Text,
-	}
-	q.Ns = []dns.RR{srv, txt}
-
-	randomizer := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for i := 0; i < 3; i++ {
-		if err := s.multicastResponse(q); err != nil {
-			log.Println("[ERR] bonjour: failed to send probe:", err.Error())
-		}
-		time.Sleep(time.Duration(randomizer.Intn(250)) * time.Millisecond)
-	}
-	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
-	resp.Answer = []dns.RR{}
-	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(true, resp, s.ttl)
-
-	// From RFC6762
-	//    The Multicast DNS responder MUST send at least two unsolicited
-	//    responses, one second apart. To provide increased robustness against
-	//    packet loss, a responder MAY send up to eight unsolicited responses,
-	//    provided that the interval between unsolicited responses increases by
-	//    at least a factor of two with every response sent.
-	for !s.shouldShutdown {
-		timeout := 1 * time.Second
-		for i := 0; i < 3 && !s.shouldShutdown; i++ {
-			log.Println("Unsolicited", resp)
-			if err := s.multicastResponse(resp); err != nil {
-				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
-			}
-			time.Sleep(timeout)
-			timeout *= 2
-		}
-	}
-}
-
 // announceText sends a Text announcement with cache flush enabled
 func (s *Server) announceText() {
 	service := s.GetServiceEntry()
@@ -679,7 +724,7 @@ func (s *Server) unicastResponse(resp *dns.Msg, from net.Addr) error {
 // multicastResponse us used to send a multicast response packet
 func (c *Server) multicastResponse(msg *dns.Msg) error {
 	buf, err := msg.Pack()
-	//log.Println("Sending out multicast", msg)
+	//log.Println("Sending out multicast", query)
 	if err != nil {
 		log.Println("Failed to pack message!")
 		return err
