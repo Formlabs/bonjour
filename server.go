@@ -90,8 +90,8 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 	entry.HostName = strings.ToLower(entry.HostName)
 	s.SetServiceEntry(entry)
 
-	s.waitGroup.Add(1)
-	go s.mainloop()
+	//s.waitGroup.Add(1)
+	//go s.mainloop()
 	s.waitGroup.Add(1)
 	go s.probe()
 
@@ -287,18 +287,39 @@ func (s *Server) probe() {
 	}
 	q.Ns = []dns.RR{srv, txt}
 
+	ticker := time.NewTicker(1 * time.Millisecond)
 	randomizer := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for i := 0; i < 3; i++ {
-		if err := s.multicastResponse(q); err != nil {
-			log.Println("[ERR] bonjour: failed to send probe:", err.Error())
+
+	i := 0
+	L:
+	for {
+		select {
+		case <-ticker.C:
+			i++
+			if i > 3 {
+				break L
+			}
+			log.Println("probe", q)
+			if err := s.multicastResponse(q); err != nil {
+				log.Println("[ERR] bonjour: failed to send probe:", err.Error())
+			}
+			ticker.Stop()
+			ticker = time.NewTicker(time.Duration(randomizer.Intn(250)) * time.Millisecond)
+			break
+
+		case <-s.shutdownChanProbe:
+			ticker.Stop()
+			return
 		}
-		time.Sleep(time.Duration(randomizer.Intn(250)) * time.Millisecond)
 	}
+
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
 	s.composeLookupAnswers(true, resp, s.ttl)
+
+	i = 0
 
 	// From RFC6762
 	//    The Multicast DNS responder MUST send at least two unsolicited
@@ -306,15 +327,29 @@ func (s *Server) probe() {
 	//    packet loss, a responder MAY send up to eight unsolicited responses,
 	//    provided that the interval between unsolicited responses increases by
 	//    at least a factor of two with every response sent.
-	for !s.shouldShutdown {
-		timeout := 1 * time.Second
-		for i := 0; i < 3 && !s.shouldShutdown; i++ {
-			log.Println("Unsolicited", resp)
+	timeout := 1 * time.Second
+	ticker = time.NewTicker(timeout)
+	for {
+		select {
+		case <-ticker.C:
+			i++
+			if i > 3 {
+				timeout = 1 * time.Second
+				i = 0
+			}
+
+			log.Println("announce", resp)
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
 			}
-			time.Sleep(timeout)
+			ticker.Stop()
+			ticker = time.NewTicker(timeout)
 			timeout *= 2
+			break
+
+		case <-s.shutdownChanProbe:
+			ticker.Stop()
+			return
 		}
 	}
 }
