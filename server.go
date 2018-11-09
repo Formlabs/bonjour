@@ -217,12 +217,6 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 	timeout := 1 * time.Second
 	ticker := time.NewTicker(timeout)
 
-	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
-	resp.Answer = []dns.RR{}
-	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(entry, true, resp, s.ttl)
-
 	i := 0
 
 	for {
@@ -240,6 +234,13 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 				timeout = 1 * time.Second
 				i = 0
 			}
+
+			resp := new(dns.Msg)
+			resp.MsgHdr.Response = true
+			resp.Answer = []dns.RR{}
+			resp.Extra = []dns.RR{}
+
+			s.composeLookupAnswers(entry, true, resp, s.ttl)
 
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
