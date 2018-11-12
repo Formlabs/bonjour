@@ -123,7 +123,7 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 		log.Printf("[ERR] bonjour: Failed to bind to udp6 port: %v", err)
 	}
 	if ipv4conn == nil && ipv6conn == nil {
-		return nil, fmt.Errorf("[ERR] bonjour: Failed to bind to any udp port!")
+		return nil, fmt.Errorf("[ERR] bonjour: Failed to bind to any udp port")
 	}
 
 	// Join multicast groups to receive announcements
@@ -165,7 +165,7 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 			}
 		}
 		if len(ifaces) == errCount1 && len(ifaces) == errCount2 {
-			return nil, fmt.Errorf("Failed to join multicast group on all interfaces!")
+			return nil, fmt.Errorf("failed to join multicast group on all interfaces")
 		}
 	}
 
