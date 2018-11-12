@@ -219,6 +219,8 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 
 	i := 0
 
+	useCacheFlush := true
+
 	for {
 		select {
 		case <-s.shutdownChan:
@@ -226,6 +228,9 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			return
 
 		case entry = <-entries:
+			i = 0
+			timeout = 1 * time.Second
+			useCacheFlush = true
 			break
 
 		case <-ticker.C:
@@ -233,6 +238,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			if i > 3 {
 				timeout = 1 * time.Second
 				i = 0
+				useCacheFlush = false
 			}
 
 			resp := new(dns.Msg)
@@ -240,7 +246,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 
-			s.composeLookupAnswers(entry, true, resp, s.ttl)
+			s.composeLookupAnswers(entry, useCacheFlush, resp, s.ttl)
 
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
