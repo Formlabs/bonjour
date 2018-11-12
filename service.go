@@ -54,7 +54,11 @@ func (s *ServiceRecord) ServiceTypeName() string {
 
 // Constructs a ServiceRecord structure by given arguments
 func NewServiceRecord(instance, service, domain string) *ServiceRecord {
-	return &ServiceRecord{instance, service, domain, "", "", ""}
+	res := &ServiceRecord{instance, service, domain, "", "", ""}
+	res.ServiceName()
+	res.ServiceInstanceName()
+	res.ServiceTypeName()
+	return res
 }
 
 // LookupParams contains configurable properties to create a service discovery request
