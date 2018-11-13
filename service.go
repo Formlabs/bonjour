@@ -54,7 +54,11 @@ func (s *ServiceRecord) ServiceTypeName() string {
 
 // Constructs a ServiceRecord structure by given arguments
 func NewServiceRecord(instance, service, domain string) *ServiceRecord {
-	return &ServiceRecord{instance, service, domain, "", "", ""}
+	res := &ServiceRecord{instance, service, domain, "", "", ""}
+	res.ServiceName()
+	res.ServiceInstanceName()
+	res.ServiceTypeName()
+	return res
 }
 
 // LookupParams contains configurable properties to create a service discovery request
@@ -76,12 +80,12 @@ func NewLookupParams(instance, service, domain string, entries chan<- *ServiceEn
 // used to answer multicast queries.
 type ServiceEntry struct {
 	ServiceRecord
-	HostName  string   `json:"hostname"` // Host machine DNS name
-	Port      int      `json:"port"`     // Service Port
-	Text      []string `json:"text"`     // Service info served as a TXT record
-	TTL       uint32   `json:"ttl"`      // TTL of the service record
-	AddrsIPv4 []net.IP `json:"-"`        // Host machine IPv4 address
-	AddrsIPv6 []net.IP `json:"-"`        // Host machine IPv6 address
+	HostName   string   `json:"hostname"` // Host machine DNS name
+	Port       int      `json:"port"`     // Service Port
+	Text       []string `json:"text"`     // Service info served as a TXT record
+	TTL        uint32   `json:"ttl"`      // TTL of the service record
+	AddrsIPv4  []net.IP `json:"-"`        // Host machine IPv4 address
+	AddrsIPv6  []net.IP `json:"-"`        // Host machine IPv6 address
 }
 
 // Constructs a ServiceEntry structure by given arguments
