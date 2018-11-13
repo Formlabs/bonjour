@@ -105,7 +105,6 @@ type Server struct {
 	initialEntry      *ServiceEntry
 	shouldShutdown    bool
 	shutdownChan      chan bool
-	shutdownChanProbe chan bool
 	waitGroup         sync.WaitGroup
 	shutdownLock      sync.Mutex
 	ttl               uint32
@@ -688,7 +687,7 @@ func (s *Server) unicastResponse(resp *dns.Msg, from net.Addr) error {
 // multicastResponse us used to send a multicast response packet
 func (c *Server) multicastResponse(msg *dns.Msg) error {
 	buf, err := msg.Pack()
-	//log.Println("Sending out multicast", query)
+
 	if err != nil {
 		log.Println("Failed to pack message!")
 		return err
