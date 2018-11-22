@@ -171,7 +171,7 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 	s := &Server{
 		ipv4conn:     ipv4conn,
 		ipv6conn:     ipv6conn,
-		ttl:          3200,
+		ttl:          60 * 5,
 		shutdownChan: make(chan bool),
 		initialEntry: initialEntry,
 	}
@@ -218,8 +218,6 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 
 	i := 0
 
-	useCacheFlush := true
-
 	for {
 		select {
 		case <-s.shutdownChan:
@@ -229,7 +227,6 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 		case entry = <-entries:
 			i = 0
 			timeout = 1 * time.Second
-			useCacheFlush = true
 			break
 
 		case <-ticker.C:
@@ -237,7 +234,6 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			if i > 3 {
 				timeout = 1 * time.Second
 				i = 0
-				useCacheFlush = false
 			}
 
 			resp := new(dns.Msg)
@@ -245,7 +241,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 
-			s.composeLookupAnswers(entry, useCacheFlush, resp, s.ttl)
+			s.composeLookupAnswers(entry, true, resp, s.ttl)
 
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
