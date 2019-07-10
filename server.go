@@ -73,7 +73,7 @@ func MakeServiceEntry(instance, service, domain string,
 		} else if ipv4 := ipAddr.To4(); ipv4 != nil {
 			entry.AddrsIPv4 = append(entry.AddrsIPv4, ipv4)
 		} else if ipv6 := ipAddr.To16(); ipv6 != nil {
-			entry.AddrsIPv6 = append(entry.AddrsIPv6, ipv4)
+			entry.AddrsIPv6 = append(entry.AddrsIPv6, ipv6)
 		} else {
 			return nil, fmt.Errorf("The IP is neither IPv4 nor IPv6: %#v", ipAddr)
 		}
