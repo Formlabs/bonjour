@@ -547,7 +547,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceName(),
 			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
 		Ptr: service.ServiceInstanceName(),
