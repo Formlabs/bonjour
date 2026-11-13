@@ -514,3 +514,88 @@ func TestMulticastRateLimit(t *testing.T) {
 		t.Errorf("got %d replies once a second had passed, want 2", len(*sent))
 	}
 }
+
+// probeFor returns a probe: a query for name with a proposed record in the authority section
+func probeFor(name string, qtype uint16) *dns.Msg {
+	q := new(dns.Msg)
+	q.Question = []dns.Question{question(name, qtype, false)}
+	q.Ns = []dns.RR{&dns.SRV{
+		Hdr:    dns.RR_Header{Name: name, Rrtype: dns.TypeSRV, Class: dns.ClassINET, Ttl: 120},
+		Port:   80,
+		Target: "other.local.",
+	}}
+	return q
+}
+
+// A query does not escape the delay and the rate limit of shared records by
+// carrying an authority section: only unique records are defended
+func TestProbesDoNotHurrySharedRecords(t *testing.T) {
+	entry := testEntry(t)
+	s, sent := testServer(t)
+	for i := 0; i < 50; i++ {
+		before := len(*sent)
+		receive(t, s, entry, probeFor(entry.ServiceName(), dns.TypePTR), querier)
+		if len(*sent) != before {
+			t.Fatalf("browse reply sent at once to a query with an authority section")
+		}
+		settle(s)
+	}
+	if len(*sent) != 1 {
+		t.Errorf("got %d replies to 50 queries within a second, want 1", len(*sent))
+	}
+}
+
+func TestProbesAreAnsweredAtOnce(t *testing.T) {
+	entry := testEntry(t)
+	s, sent := testServer(t)
+	announce := func() {
+		announcement := new(dns.Msg)
+		s.composeLookupAnswers(entry, announcement, s.ttl)
+		s.multicastRateLimited(announcement)
+	}
+	age := func(d time.Duration) {
+		for k := range s.lastMulticast {
+			s.lastMulticast[k] = time.Now().Add(-d)
+		}
+	}
+	probe := probeFor(entry.ServiceInstanceName(), dns.TypeANY)
+
+	// a record multicast under 250 ms ago is not repeated even for a probe
+	announce()
+	receive(t, s, entry, probe, querier)
+	if len(*sent) != 1 || len(s.pending) != 0 {
+		t.Fatalf("got %d packets and %d waiting, want only the announcement", len(*sent), len(s.pending))
+	}
+	// after 250 ms it is, although an ordinary query would wait out the full second
+	age(250 * time.Millisecond)
+	plain := new(dns.Msg)
+	plain.Question = probe.Question
+	receive(t, s, entry, plain, querier)
+	if len(*sent) != 1 {
+		t.Fatalf("ordinary query answered %v after the announcement", 250*time.Millisecond)
+	}
+	receive(t, s, entry, probe, querier)
+	if len(*sent) != 2 || len(s.pending) != 0 {
+		t.Fatalf("got %d packets and %d waiting, want the announcement and an immediate probe answer", len(*sent), len(s.pending))
+	}
+	if countTypes((*sent)[1].msg.Answer)[dns.TypeSRV] != 1 {
+		t.Errorf("probe answer has no SRV record")
+	}
+	// the answer counts as a multicast of the record
+	receive(t, s, entry, probe, querier)
+	if len(*sent) != 2 {
+		t.Errorf("probe answered twice within 250 ms")
+	}
+
+	// a probe among several questions is still answered at once. The host's addresses
+	// travel with the first answer, so the second question adds no packet.
+	s, sent = testServer(t)
+	probe.Question = append(probe.Question, question(entry.HostName, dns.TypeANY, false))
+	receive(t, s, entry, probe, querier)
+	if len(*sent) != 1 || len(s.pending) != 0 {
+		t.Fatalf("got %d packets and %d waiting for a probe with two questions, want 1 and 0", len(*sent), len(s.pending))
+	}
+	if all := countTypes(append((*sent)[0].msg.Answer, (*sent)[0].msg.Extra...)); all[dns.TypeSRV] != 1 || all[dns.TypeA] != 1 {
+		t.Errorf("probe answer holds %v, want the SRV record and the address", all)
+	}
+}

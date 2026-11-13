@@ -416,10 +416,8 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 	if request.query.Response || request.query.Opcode != dns.OpcodeQuery || request.query.Rcode != dns.RcodeSuccess {
 		return nil
 	}
-	// Ignore questions with Authorative section for now
-	if len(request.query.Ns) > 0 {
-		return nil
-	}
+	// RFC 6762 8.2: a probe carries its proposed records in the authority section
+	probe := len(request.query.Ns) > 0
 	// RFC 6762 7.2: known answers that follow a truncated query apply to the replies still
 	// waiting for it, but not to a reply that another querier is waiting for too
 	for _, p := range s.pending {
@@ -469,7 +467,10 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 				// questions (6.3), or when the known answers of a truncated query are still to come (7.2).
 				// A legacy reply answers one question of one resolver and is sent at once.
 				delay := request.query.Truncated || len(request.query.Question) > 1 || slices.ContainsFunc(resp.Answer, isShared)
-				if delay && !legacy {
+				// Answers that defend our unique records against a probe are sent at once (6.3).
+				// A shared record needs no defending, so a probe cannot hurry or repeat one.
+				defending := probe && !slices.ContainsFunc(resp.Answer, isShared)
+				if delay && !legacy && !defending {
 					d := resp
 					s.deferReply(&d, to, request)
 				} else if to != nil {
@@ -478,8 +479,13 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 						err = e
 					}
 				} else {
-					// Send mulicast
-					if e := s.multicastRateLimited(&resp); e != nil {
+					// Send mulicast. A record may be repeated after 250 ms rather than a
+					// second when it defends against a probe (RFC 6762 6).
+					gap := time.Second
+					if defending {
+						gap = 250 * time.Millisecond
+					}
+					if e := s.multicastSpaced(&resp, gap); e != nil {
 						err = e
 					}
 				}
