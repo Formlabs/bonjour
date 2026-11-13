@@ -247,7 +247,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 
-			s.composeLookupAnswers(entry, true, resp, s.ttl)
+			s.composeLookupAnswers(entry, resp, s.ttl)
 
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
@@ -397,21 +397,7 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 					q, err)
 				continue
 			}
-			// RFC 6762 7.1: leave out answers the querier already holds with at least half our TTL
-			answers := resp.Answer[:0]
-			for _, rr := range resp.Answer {
-				known := false
-				for _, ka := range request.query.Answer {
-					if ka.Header().Ttl >= rr.Header().Ttl/2 && sameRecord(rr, ka) {
-						known = true
-						break
-					}
-				}
-				if !known {
-					answers = append(answers, rr)
-				}
-			}
-			resp.Answer = answers
+			resp.Answer = suppressKnown(resp.Answer, request.query.Answer)
 			if len(resp.Answer) > 0 {
 				if isUnicastQuestion(q) {
 					// Send unicast
@@ -439,30 +425,26 @@ func (s *Server) handleQuestion(q dns.Question, service *ServiceEntry, resp *dns
 
 	switch canonicalName(q.Name) {
 	case canonicalName(service.HostName):
-		s.composeHostAnswers(service, isUnicastQuestion(q), resp, s.ttl)
+		s.composeHostAnswers(service, resp, s.ttl)
 	case canonicalName(service.ServiceName()):
-		s.composeBrowsingAnswers(service, isUnicastQuestion(q), resp, s.ttl)
+		s.composeBrowsingAnswers(service, resp, s.ttl)
 	case canonicalName(service.ServiceInstanceName()):
-		s.composeLookupAnswers(service, isUnicastQuestion(q), resp, s.ttl)
+		s.composeLookupAnswers(service, resp, s.ttl)
 	case canonicalName(service.ServiceTypeName()):
-		s.serviceTypeName(service, isUnicastQuestion(q), resp, s.ttl)
+		s.serviceTypeName(service, resp, s.ttl)
 	}
 
 	return nil
 }
 
-func (s *Server) composeHostAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
-	cacheFlush := uint16(1 << 15)
-	if !useCacheFlush {
-		cacheFlush = 0
-	}
+func (s *Server) composeHostAnswers(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
 
 	for _, ipAddr := range service.AddrsIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
@@ -474,7 +456,7 @@ func (s *Server) composeHostAnswers(service *ServiceEntry, useCacheFlush bool, r
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
@@ -484,17 +466,13 @@ func (s *Server) composeHostAnswers(service *ServiceEntry, useCacheFlush bool, r
 	resp.Question = make([]dns.Question, 0)
 }
 
-func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
-	cacheFlush := uint16(1 << 15)
-	if !useCacheFlush {
-		cacheFlush = 0
-	}
+func (s *Server) composeBrowsingAnswers(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
 
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceName(),
 			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
 		Ptr: service.ServiceInstanceName(),
@@ -505,7 +483,7 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET | cacheFlushBit,
 			Ttl:    ttl,
 		},
 		Txt: service.Text,
@@ -514,7 +492,7 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET | cacheFlushBit,
 			Ttl:    ttl,
 		},
 		Priority: 0,
@@ -529,7 +507,7 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
@@ -541,7 +519,7 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
@@ -550,16 +528,8 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 	}
 }
 
-func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
-	// From RFC6762
-	//    The most significant bit of the rrclass for a record in the Answer
-	//    Section of a response message is the Multicast DNS cache-flush bit
-	//    and is discussed in more detail below in Section 10.2, "Announcements
-	//    to Flush Outdated Cache Entries".
-	cacheFlush := uint16(1 << 15)
-	if !useCacheFlush {
-		cacheFlush = 0
-	}
+func (s *Server) composeLookupAnswers(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
+	// RFC 6762 10.2: the cache-flush bit goes on unique records only, never on the shared PTRs
 
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
@@ -574,7 +544,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET | cacheFlushBit,
 			Ttl:    ttl,
 		},
 		Priority: 0,
@@ -586,7 +556,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET | cacheFlushBit,
 			Ttl:    ttl,
 		},
 		Txt: service.Text,
@@ -607,7 +577,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
@@ -619,7 +589,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
@@ -629,11 +599,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 	resp.Question = make([]dns.Question, 0)
 }
 
-func (s *Server) serviceTypeName(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
-	cacheFlush := uint16(1 << 15)
-	if !useCacheFlush {
-		cacheFlush = 0
-	}
+func (s *Server) serviceTypeName(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
 	// From RFC6762
 	// 9.  Service Type Enumeration
 	//
@@ -646,7 +612,7 @@ func (s *Server) serviceTypeName(service *ServiceEntry, useCacheFlush bool, resp
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
 		Ptr: service.ServiceName(),
@@ -678,7 +644,7 @@ func (s *Server) unregister(service *ServiceEntry) error {
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(service, true, resp, 0)
+	s.composeLookupAnswers(service, resp, 0)
 	return s.multicastResponse(resp)
 }
 
@@ -717,6 +683,29 @@ func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
 	}
 	_, err := s.ipv6conn.WriteToUDP(buf, addr)
 	return err
+}
+
+// suppressKnown removes the answers that known holds with at least half our TTL (RFC 6762 7.1).
+// A unique record stays when another record of its set does: the cache-flush bit on the
+// one we send would make its receivers drop the ones we left out (RFC 6762 10.2).
+func suppressKnown(answers, known []dns.RR) []dns.RR {
+	isKnown := func(rr dns.RR) bool {
+		return slices.ContainsFunc(known, func(ka dns.RR) bool {
+			return ka.Header().Ttl >= rr.Header().Ttl/2 && sameRecord(rr, ka)
+		})
+	}
+	unknown := slices.DeleteFunc(slices.Clone(answers), isKnown)
+	return slices.DeleteFunc(answers, func(rr dns.RR) bool {
+		return isKnown(rr) && (isShared(rr) || !slices.ContainsFunc(unknown, func(u dns.RR) bool {
+			return u.Header().Rrtype == rr.Header().Rrtype && canonicalName(u.Header().Name) == canonicalName(rr.Header().Name)
+		}))
+	})
+}
+
+// isShared reports whether other responders may hold records of rr's name and type.
+// Of the records we publish, those are the PTRs.
+func isShared(rr dns.RR) bool {
+	return rr.Header().Rrtype == dns.TypePTR
 }
 
 // sameRecord reports whether a and b have the same name, type, class and rdata
