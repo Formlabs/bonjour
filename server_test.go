@@ -328,3 +328,69 @@ func TestContinuationKnownAnswersApplyToDeferredReply(t *testing.T) {
 		}
 	}
 }
+
+// A record set sent with the cache-flush bit replaces the set its receivers hold, so
+// when the querier knows only some of the host's addresses the whole set is sent
+func TestUniqueRecordSetsAreSentWhole(t *testing.T) {
+	entry, err := MakeServiceEntry("X", "_formlabs_formule._tcp", "local", 35, "X.local.",
+		[]net.IP{net.ParseIP("fe80::1"), net.ParseIP("2001:db8::1")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := func(ips ...string) []dns.RR {
+		var rrs []dns.RR
+		for _, ip := range ips {
+			rrs = append(rrs, &dns.AAAA{
+				Hdr:  dns.RR_Header{Name: entry.HostName, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+				AAAA: net.ParseIP(ip),
+			})
+		}
+		return rrs
+	}
+	cases := []struct {
+		desc  string
+		known []dns.RR
+		want  int
+	}{
+		{"none known", nil, 2},
+		{"one of two known", known("fe80::1"), 2},
+		{"both known", known("fe80::1", "2001:db8::1"), 0},
+	}
+	for _, c := range cases {
+		s, sent := testServer(t)
+		q := new(dns.Msg)
+		q.Question = []dns.Question{question(entry.HostName, dns.TypeAAAA, false)}
+		q.Answer = c.known
+		receive(t, s, entry, q, querier)
+		got := 0
+		if len(*sent) == 1 {
+			got = countTypes((*sent)[0].msg.Answer)[dns.TypeAAAA]
+		}
+		if got != c.want {
+			t.Errorf("%s: reply holds %d AAAA records, want %d", c.desc, got, c.want)
+		}
+	}
+}
+
+func TestCacheFlushOnUniqueRecordsOnly(t *testing.T) {
+	entry := testEntry(t)
+	for _, name := range []string{entry.HostName, entry.ServiceName(), entry.ServiceInstanceName(), entry.ServiceTypeName()} {
+		for _, unicast := range []bool{true, false} {
+			s, sent := testServer(t)
+			q := new(dns.Msg)
+			q.Question = []dns.Question{question(name, dns.TypeANY, unicast)}
+			receive(t, s, entry, q, querier)
+			settle(s)
+			if len(*sent) != 1 {
+				t.Fatalf("%s unicast=%v: got %d replies, want 1", name, unicast, len(*sent))
+			}
+			reply := &(*sent)[0].msg
+			for _, rr := range append(reply.Answer, reply.Extra...) {
+				shared := rr.Header().Rrtype == dns.TypePTR
+				if flush := rr.Header().Class&cacheFlushBit != 0; flush == shared {
+					t.Errorf("%s unicast=%v: %s has cache-flush %v", name, unicast, dns.TypeToString[rr.Header().Rrtype], flush)
+				}
+			}
+		}
+	}
+}
