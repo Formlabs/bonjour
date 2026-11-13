@@ -1,6 +1,7 @@
 package bonjour
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -141,11 +142,19 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 	// Join multicast groups to receive announcements
 	var p1 *ipv4.PacketConn
 	var p2 *ipv6.PacketConn
+	// RFC 6762 11: send with IP TTL 255. Multicast loopback stays on: other mDNS
+	// software on this host only hears us through it.
 	if ipv4conn != nil {
 		p1 = ipv4.NewPacketConn(ipv4conn)
+		if err := errors.Join(p1.SetTTL(255), p1.SetMulticastTTL(255)); err != nil {
+			log.Printf("[ERR] bonjour: Failed to set udp4 socket options: %v", err)
+		}
 	}
 	if ipv6conn != nil {
 		p2 = ipv6.NewPacketConn(ipv6conn)
+		if err := errors.Join(p2.SetHopLimit(255), p2.SetMulticastHopLimit(255)); err != nil {
+			log.Printf("[ERR] bonjour: Failed to set udp6 socket options: %v", err)
+		}
 	}
 	if iface != nil {
 		if p1 != nil {
