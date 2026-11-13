@@ -332,6 +332,9 @@ func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
 		println("Could not set buffer size", e)
 	}
 	buf := make([]byte, 65536)
+	// Interface names by index. Dropped every minute so a renamed or replaced interface is noticed.
+	zones := map[uint32]string{}
+	zonesRead := time.Now()
 
 	i := 0
 	bytes := 0
@@ -344,6 +347,22 @@ func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
 			from = &net.UDPAddr{IP: sa.Addr[0:], Port: sa.Port}
 		case *syscall.SockaddrInet6:
 			from = &net.UDPAddr{IP: sa.Addr[0:], Port: sa.Port}
+			// Unicast replies to link-local sources need the zone to pick the interface
+			if sa.ZoneId != 0 {
+				if time.Since(zonesRead) > time.Minute {
+					clear(zones)
+					zonesRead = time.Now()
+				}
+				name, ok := zones[sa.ZoneId]
+				if !ok {
+					// a failed lookup is remembered too, as the empty name, so it is not repeated for every packet
+					if ifi, err := net.InterfaceByIndex(int(sa.ZoneId)); err == nil {
+						name = ifi.Name
+					}
+					zones[sa.ZoneId] = name
+				}
+				from.Zone = name
+			}
 		}
 
 		if err != nil {
