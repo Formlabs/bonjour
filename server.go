@@ -250,6 +250,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
+			resp.MsgHdr.Authoritative = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 
@@ -395,6 +396,9 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 		}
 	}
 
+	// RFC 6762 6.7: a query not sent from port 5353 comes from a plain DNS resolver
+	legacy := request.from.(*net.UDPAddr).Port != 5353
+
 	// Handle each question
 	var (
 		resp dns.Msg
@@ -403,7 +407,8 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 	if len(request.query.Question) > 0 {
 		for _, q := range request.query.Question {
 			resp = dns.Msg{}
-			resp.SetReply(&request.query)
+			resp.Response = true
+			resp.Authoritative = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 			if err = s.handleQuestion(q, service, &resp); err != nil {
@@ -412,15 +417,27 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 				continue
 			}
 			resp.Answer = suppressKnown(resp.Answer, request.query.Answer)
+			if legacy {
+				resp.Id = request.query.Id
+				resp.Question = []dns.Question{q}
+				for _, rrs := range [][]dns.RR{resp.Answer, resp.Extra} {
+					for _, rr := range rrs {
+						rr.Header().Class &^= cacheFlushBit
+						rr.Header().Ttl = min(rr.Header().Ttl, 10)
+					}
+				}
+			}
 			if len(resp.Answer) > 0 {
 				var to *net.UDPAddr // nil for a multicast reply
-				if isUnicastQuestion(q) {
+				if legacy || isUnicastQuestion(q) {
 					to = request.from.(*net.UDPAddr)
 				}
 				// RFC 6762 6: a reply waits a random delay when other responders may be answering
 				// too, which is the case for shared records and for any query with several
-				// questions (6.3), or when the known answers of a truncated query are still to come (7.2)
-				if request.query.Truncated || len(request.query.Question) > 1 || slices.ContainsFunc(resp.Answer, isShared) {
+				// questions (6.3), or when the known answers of a truncated query are still to come (7.2).
+				// A legacy reply answers one question of one resolver and is sent at once.
+				delay := request.query.Truncated || len(request.query.Question) > 1 || slices.ContainsFunc(resp.Answer, isShared)
+				if delay && !legacy {
 					d := resp
 					s.deferReply(&d, to, request)
 				} else if to != nil {
@@ -567,7 +584,6 @@ func (s *Server) composeHostAnswers(service *ServiceEntry, resp *dns.Msg, ttl ui
 		}
 		resp.Answer = append(resp.Answer, aaaa)
 	}
-	resp.Question = make([]dns.Question, 0)
 }
 
 func (s *Server) composeBrowsingAnswers(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
@@ -700,7 +716,6 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, resp *dns.Msg, ttl 
 		}
 		resp.Extra = append(resp.Extra, aaaa)
 	}
-	resp.Question = make([]dns.Question, 0)
 }
 
 func (s *Server) serviceTypeName(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
@@ -728,6 +743,7 @@ func (s *Server) serviceTypeName(service *ServiceEntry, resp *dns.Msg, ttl uint3
 func (s *Server) announceText(service *ServiceEntry) {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
+	resp.MsgHdr.Authoritative = true
 
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
@@ -746,6 +762,7 @@ func (s *Server) announceText(service *ServiceEntry) {
 func (s *Server) unregister(service *ServiceEntry) error {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
+	resp.MsgHdr.Authoritative = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
 	s.composeLookupAnswers(service, resp, 0)

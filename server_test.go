@@ -394,3 +394,71 @@ func TestCacheFlushOnUniqueRecordsOnly(t *testing.T) {
 		}
 	}
 }
+
+// A legacy reply repeats the ID and question of one query, so it is neither
+// delayed nor merged with other replies, even for shared records
+func TestLegacyRepliesAreSentAtOnce(t *testing.T) {
+	entry := testEntry(t)
+	s, sent := testServer(t)
+	q := new(dns.Msg)
+	q.Id = 1234
+	q.Question = []dns.Question{
+		question(entry.ServiceName(), dns.TypePTR, false),
+		question(entry.HostName, dns.TypeA, false),
+	}
+	receive(t, s, entry, q, &net.UDPAddr{IP: querier.IP, Port: 54321})
+	if len(*sent) != 2 || len(s.pending) != 0 {
+		t.Fatalf("%d replies sent and %d waiting, want 2 and 0", len(*sent), len(s.pending))
+	}
+	for i, p := range *sent {
+		if p.to == nil || p.msg.Id != 1234 || len(p.msg.Question) != 1 || p.msg.Question[0].Name != q.Question[i].Name {
+			t.Errorf("reply %d: to %v, id %d, questions %v", i, p.to, p.msg.Id, p.msg.Question)
+		}
+	}
+}
+
+func TestResponseHeader(t *testing.T) {
+	entry := testEntry(t)
+	legacyQuerier := &net.UDPAddr{IP: querier.IP, Port: 54321}
+	cases := []struct {
+		desc    string
+		from    *net.UDPAddr
+		unicast bool
+		legacy  bool
+	}{
+		{"QU query", querier, true, false},
+		{"QM query", querier, false, false},
+		{"legacy unicast query", legacyQuerier, false, true},
+	}
+	for _, c := range cases {
+		s, sent := testServer(t)
+		q := new(dns.Msg)
+		q.Id = 1234
+		q.Question = []dns.Question{question(entry.HostName, dns.TypeA, c.unicast)}
+		receive(t, s, entry, q, c.from)
+		if len(*sent) != 1 {
+			t.Fatalf("%s: got %d replies, want 1", c.desc, len(*sent))
+		}
+		p := (*sent)[0]
+		if !p.msg.Response || !p.msg.Authoritative || p.msg.Opcode != dns.OpcodeQuery {
+			t.Errorf("%s: header %+v, want QR and AA set and opcode 0", c.desc, p.msg.MsgHdr)
+		}
+		if wantUnicast := c.unicast || c.legacy; (p.to != nil) != wantUnicast {
+			t.Errorf("%s: sent to %v, want unicast %v", c.desc, p.to, wantUnicast)
+		}
+		if !c.legacy {
+			if p.msg.Id != 0 || len(p.msg.Question) != 0 {
+				t.Errorf("%s: id %d and %d questions, want 0 and 0", c.desc, p.msg.Id, len(p.msg.Question))
+			}
+			continue
+		}
+		if p.msg.Id != 1234 || len(p.msg.Question) != 1 {
+			t.Errorf("%s: id %d and %d questions, want 1234 and 1", c.desc, p.msg.Id, len(p.msg.Question))
+		}
+		for _, rr := range append(p.msg.Answer, p.msg.Extra...) {
+			if rr.Header().Ttl > 10 || rr.Header().Class&cacheFlushBit != 0 {
+				t.Errorf("%s: %s", c.desc, rr.String())
+			}
+		}
+	}
+}
