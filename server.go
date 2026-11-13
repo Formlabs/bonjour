@@ -420,16 +420,14 @@ func (s *Server) handleQuestion(q dns.Question, service *ServiceEntry, resp *dns
 		return nil
 	}
 
-	var name = strings.ToLower(q.Name)
-
-	switch name {
-	case service.HostName:
+	switch canonicalName(q.Name) {
+	case canonicalName(service.HostName):
 		s.composeHostAnswers(service, isUnicastQuestion(q), resp, s.ttl)
-	case service.ServiceName():
+	case canonicalName(service.ServiceName()):
 		s.composeBrowsingAnswers(service, isUnicastQuestion(q), resp, s.ttl)
-	case service.ServiceInstanceName():
+	case canonicalName(service.ServiceInstanceName()):
 		s.composeLookupAnswers(service, isUnicastQuestion(q), resp, s.ttl)
-	case service.ServiceTypeName():
+	case canonicalName(service.ServiceTypeName()):
 		s.serviceTypeName(service, isUnicastQuestion(q), resp, s.ttl)
 	}
 
