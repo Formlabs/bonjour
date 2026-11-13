@@ -3,6 +3,7 @@ package bonjour
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"slices"
 	"strings"
@@ -113,6 +114,10 @@ type Server struct {
 	ttl               uint32
 	// send writes a packet to addr, or to both multicast groups when addr is nil
 	send func(buf []byte, addr *net.UDPAddr) error
+
+	// Replies waiting out their RFC 6762 6 delay, and the timer for the earliest. Owned by mainloop.
+	pending      []*pendingReply
+	pendingTimer <-chan time.Time
 }
 
 // Constructs server structure
@@ -231,6 +236,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			return
 
 		case entry = <-entries:
+			s.pending, s.pendingTimer = nil, nil
 			i = 0
 			timeout = 1 * time.Second
 			break
@@ -257,6 +263,9 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			timeout *= 2
 			break
 
+
+		case <-s.pendingTimer:
+			s.sendDue(time.Now())
 
 		case req := <-requests:
 			s.handleQuery(entry, req)
@@ -360,14 +369,12 @@ func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
 func (s *Server) parsePacket(packet []byte, from net.Addr) (*Request, error) {
 	var request Request
 	request.from = from
-	if err := request.query.Unpack(packet); err != nil {
-		if err != dns.ErrTruncated {
-			log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
-		}
+	// ErrTruncated only reports the TC bit; the message is fully unpacked
+	if err := request.query.Unpack(packet); err != nil && err != dns.ErrTruncated {
+		log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
 		return nil, err
-	} else {
-		return &request, nil
 	}
+	return &request, nil
 }
 
 // handleQuery is used to handle an incoming query
@@ -379,6 +386,13 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 	// Ignore questions with Authorative section for now
 	if len(request.query.Ns) > 0 {
 		return nil
+	}
+	// RFC 6762 7.2: known answers that follow a truncated query apply to the replies still
+	// waiting for it, but not to a reply that another querier is waiting for too
+	for _, p := range s.pending {
+		if p.from == request.from.String() {
+			p.msg.Answer = suppressKnown(p.msg.Answer, request.query.Answer)
+		}
 	}
 
 	// Handle each question
@@ -397,25 +411,21 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 					q, err)
 				continue
 			}
-			// RFC 6762 7.1: leave out answers the querier already holds with at least half our TTL
-			answers := resp.Answer[:0]
-			for _, rr := range resp.Answer {
-				known := false
-				for _, ka := range request.query.Answer {
-					if ka.Header().Ttl >= rr.Header().Ttl/2 && sameRecord(rr, ka) {
-						known = true
-						break
-					}
-				}
-				if !known {
-					answers = append(answers, rr)
-				}
-			}
-			resp.Answer = answers
+			resp.Answer = suppressKnown(resp.Answer, request.query.Answer)
 			if len(resp.Answer) > 0 {
+				var to *net.UDPAddr // nil for a multicast reply
 				if isUnicastQuestion(q) {
+					to = request.from.(*net.UDPAddr)
+				}
+				// RFC 6762 6: a reply waits a random delay when other responders may be answering
+				// too, which is the case for shared records and for any query with several
+				// questions (6.3), or when the known answers of a truncated query are still to come (7.2)
+				if request.query.Truncated || len(request.query.Question) > 1 || slices.ContainsFunc(resp.Answer, isShared) {
+					d := resp
+					s.deferReply(&d, to, request)
+				} else if to != nil {
 					// Send unicast
-					if e := s.unicastResponse(&resp, request.from); e != nil {
+					if e := s.unicastResponse(&resp, to); e != nil {
 						err = e
 					}
 				} else {
@@ -429,6 +439,79 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 	}
 
 	return err
+}
+
+// pendingReply is a reply waiting out its delay
+type pendingReply struct {
+	msg *dns.Msg
+	to  *net.UDPAddr // nil for a multicast reply
+	// The one querier the reply is for, whose later known answers still apply to it.
+	// Empty once a second querier is waiting for it.
+	from string
+	due  time.Time
+}
+
+// deferReply queues resp to be sent to addr after the delay the query calls for, joining
+// it to a reply already waiting for the same destination (RFC 6762 6.4)
+func (s *Server) deferReply(resp *dns.Msg, to *net.UDPAddr, request *Request) {
+	delay := 20 + rand.Intn(101)
+	if request.query.Truncated {
+		delay = 400 + rand.Intn(101)
+	}
+	due := time.Now().Add(time.Duration(delay) * time.Millisecond)
+	from := request.from.String()
+
+	i := slices.IndexFunc(s.pending, func(p *pendingReply) bool {
+		return (p.to == nil) == (to == nil) && (to == nil || p.to.String() == to.String())
+	})
+	if i < 0 {
+		s.pending = append(s.pending, &pendingReply{msg: resp, to: to, from: from, due: due})
+	} else {
+		p := s.pending[i]
+		p.msg.Answer = appendNew(p.msg.Answer, resp.Answer)
+		p.msg.Extra = appendNew(p.msg.Extra, resp.Extra)
+		if p.from != from {
+			p.from = ""
+		}
+		// a truncated query holds the reply back until its known answers have had time to arrive
+		if request.query.Truncated && due.After(p.due) {
+			p.due = due
+		}
+	}
+	s.armPending()
+}
+
+// armPending sets the timer for the earliest waiting reply
+func (s *Server) armPending() {
+	s.pendingTimer = nil
+	if len(s.pending) == 0 {
+		return
+	}
+	next := slices.MinFunc(s.pending, func(a, b *pendingReply) int { return a.due.Compare(b.due) })
+	s.pendingTimer = time.After(time.Until(next.due))
+}
+
+// sendDue sends the waiting replies whose delay is over at now
+func (s *Server) sendDue(now time.Time) {
+	var waiting []*pendingReply
+	for _, p := range s.pending {
+		var err error
+		switch {
+		case p.due.After(now):
+			waiting = append(waiting, p)
+		case len(p.msg.Answer) == 0:
+			// the querier turned out to know every answer
+		case p.to != nil:
+			err = s.unicastResponse(p.msg, p.to)
+		default:
+			err = s.multicastResponse(p.msg)
+		}
+		if err != nil {
+			log.Println("[ERR] bonjour: failed to send reply:", err.Error())
+		}
+	}
+	s.pending = waiting
+	s.armPending()
 }
 
 // handleQuestion is used to handle an incoming question
@@ -447,6 +530,13 @@ func (s *Server) handleQuestion(q dns.Question, service *ServiceEntry, resp *dns
 	case canonicalName(service.ServiceTypeName()):
 		s.serviceTypeName(service, isUnicastQuestion(q), resp, s.ttl)
 	}
+
+	// Only records of the name asked about are answers: the service PTRs that
+	// composeLookupAnswers adds for announcements do not answer an instance lookup
+	name := canonicalName(q.Name)
+	resp.Answer = slices.DeleteFunc(resp.Answer, func(rr dns.RR) bool {
+		return canonicalName(rr.Header().Name) != name
+	})
 
 	return nil
 }
@@ -717,6 +807,31 @@ func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
 	}
 	_, err := s.ipv6conn.WriteToUDP(buf, addr)
 	return err
+}
+
+// suppressKnown removes the answers that known holds with at least half our TTL (RFC 6762 7.1)
+func suppressKnown(answers, known []dns.RR) []dns.RR {
+	return slices.DeleteFunc(answers, func(rr dns.RR) bool {
+		return slices.ContainsFunc(known, func(ka dns.RR) bool {
+			return ka.Header().Ttl >= rr.Header().Ttl/2 && sameRecord(rr, ka)
+		})
+	})
+}
+
+// isShared reports whether other responders may hold records of rr's name and type.
+// Of the records we publish, those are the PTRs.
+func isShared(rr dns.RR) bool {
+	return rr.Header().Rrtype == dns.TypePTR
+}
+
+// appendNew appends the records of src that dst does not already hold
+func appendNew(dst, src []dns.RR) []dns.RR {
+	for _, rr := range src {
+		if !slices.ContainsFunc(dst, func(d dns.RR) bool { return sameRecord(d, rr) }) {
+			dst = append(dst, rr)
+		}
+	}
+	return dst
 }
 
 // sameRecord reports whether a and b have the same name, type, class and rdata
