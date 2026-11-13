@@ -118,6 +118,9 @@ type Server struct {
 	// Replies waiting out their RFC 6762 6 delay, and the timer for the earliest. Owned by mainloop.
 	pending      []*pendingReply
 	pendingTimer <-chan time.Time
+
+	// When each answer record was last multicast, keyed by its text form. Owned by mainloop.
+	lastMulticast map[string]time.Time
 }
 
 // Constructs server structure
@@ -237,6 +240,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 
 		case entry = <-entries:
 			s.pending, s.pendingTimer = nil, nil
+			s.lastMulticast = nil
 			i = 0
 			timeout = 1 * time.Second
 			break
@@ -256,7 +260,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 
 			s.composeLookupAnswers(entry, resp, s.ttl)
 
-			if err := s.multicastResponse(resp); err != nil {
+			if err := s.multicastRateLimited(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
 			}
 			ticker.Stop()
@@ -447,7 +451,7 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 					}
 				} else {
 					// Send mulicast
-					if e := s.multicastResponse(&resp); e != nil {
+					if e := s.multicastRateLimited(&resp); e != nil {
 						err = e
 					}
 				}
@@ -521,7 +525,7 @@ func (s *Server) sendDue(now time.Time) {
 		case p.to != nil:
 			err = s.unicastResponse(p.msg, p.to)
 		default:
-			err = s.multicastResponse(p.msg)
+			err = s.multicastRateLimited(p.msg)
 		}
 		if err != nil {
 			log.Println("[ERR] bonjour: failed to send reply:", err.Error())
@@ -786,6 +790,34 @@ func (s *Server) multicastResponse(msg *dns.Msg) error {
 		return err
 	}
 	return s.send(buf, nil)
+}
+
+// multicastRateLimited multicasts the records of msg that were not multicast in the last second (RFC 6762 6)
+func (s *Server) multicastRateLimited(msg *dns.Msg) error {
+	return s.multicastSpaced(msg, time.Second)
+}
+
+// multicastSpaced multicasts the records of msg that were not multicast within the last gap.
+// The limit is per record wherever it travels, so additional records count as well.
+func (s *Server) multicastSpaced(msg *dns.Msg, gap time.Duration) error {
+	now := time.Now()
+	recent := func(rr dns.RR) bool {
+		return now.Sub(s.lastMulticast[rr.String()]) < gap
+	}
+	msg.Answer = slices.DeleteFunc(msg.Answer, recent)
+	if len(msg.Answer) == 0 {
+		return nil
+	}
+	msg.Extra = slices.DeleteFunc(msg.Extra, recent)
+	if s.lastMulticast == nil {
+		s.lastMulticast = map[string]time.Time{}
+	}
+	for _, rrs := range [][]dns.RR{msg.Answer, msg.Extra} {
+		for _, rr := range rrs {
+			s.lastMulticast[rr.String()] = now
+		}
+	}
+	return s.multicastResponse(msg)
 }
 
 func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {

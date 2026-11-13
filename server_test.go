@@ -462,3 +462,55 @@ func TestResponseHeader(t *testing.T) {
 		}
 	}
 }
+
+// The limit follows a record into the additional section: a browse reply does not
+// repeat an address multicast a moment ago, and the addresses it does carry count as sent
+func TestMulticastRateLimitCoversAdditionalRecords(t *testing.T) {
+	entry := testEntry(t)
+	host := new(dns.Msg)
+	host.Question = []dns.Question{question(entry.HostName, dns.TypeA, false)}
+	browse := new(dns.Msg)
+	browse.Question = []dns.Question{question(entry.ServiceName(), dns.TypePTR, false)}
+	addresses := func(p sentPacket) int {
+		all := countTypes(append(p.msg.Answer, p.msg.Extra...))
+		return all[dns.TypeA] + all[dns.TypeAAAA]
+	}
+
+	s, sent := testServer(t)
+	receive(t, s, entry, host, querier)
+	receive(t, s, entry, browse, querier)
+	settle(s)
+	if len(*sent) != 2 || addresses((*sent)[0]) != 2 {
+		t.Fatalf("got %d replies, want the addresses and then the browse reply", len(*sent))
+	}
+	if types := countTypes((*sent)[1].msg.Extra); addresses((*sent)[1]) != 0 || types[dns.TypeSRV] != 1 || types[dns.TypeTXT] != 1 {
+		t.Errorf("browse reply after an address reply carries %v, want SRV and TXT only", types)
+	}
+
+	s, sent = testServer(t)
+	receive(t, s, entry, browse, querier)
+	settle(s)
+	receive(t, s, entry, host, querier)
+	if len(*sent) != 1 || addresses((*sent)[0]) != 2 {
+		t.Errorf("got %d replies, want only the browse reply with its addresses", len(*sent))
+	}
+}
+
+func TestMulticastRateLimit(t *testing.T) {
+	entry := testEntry(t)
+	s, sent := testServer(t)
+	q := new(dns.Msg)
+	q.Question = []dns.Question{question(entry.HostName, dns.TypeA, false)}
+	receive(t, s, entry, q, querier)
+	receive(t, s, entry, q, querier)
+	if len(*sent) != 1 {
+		t.Fatalf("got %d replies to two queries within a second, want 1", len(*sent))
+	}
+	for k := range s.lastMulticast {
+		s.lastMulticast[k] = time.Now().Add(-time.Second)
+	}
+	receive(t, s, entry, q, querier)
+	if len(*sent) != 2 {
+		t.Errorf("got %d replies once a second had passed, want 2", len(*sent))
+	}
+}
