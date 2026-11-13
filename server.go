@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -13,6 +14,8 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
+
+const cacheFlushBit = 1 << 15
 
 var (
 	// Multicast groups used by mDNS
@@ -369,8 +372,8 @@ func (s *Server) parsePacket(packet []byte, from net.Addr) (*Request, error) {
 
 // handleQuery is used to handle an incoming query
 func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
-	// Ignore answer for now
-	if len(request.query.Answer) > 0 {
+	// RFC 6762 18.3, 18.11: messages with a non-zero opcode or response code are ignored
+	if request.query.Response || request.query.Opcode != dns.OpcodeQuery || request.query.Rcode != dns.RcodeSuccess {
 		return nil
 	}
 	// Ignore questions with Authorative section for now
@@ -394,7 +397,21 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 					q, err)
 				continue
 			}
-			// Check if there is an answer
+			// RFC 6762 7.1: leave out answers the querier already holds with at least half our TTL
+			answers := resp.Answer[:0]
+			for _, rr := range resp.Answer {
+				known := false
+				for _, ka := range request.query.Answer {
+					if ka.Header().Ttl >= rr.Header().Ttl/2 && sameRecord(rr, ka) {
+						known = true
+						break
+					}
+				}
+				if !known {
+					answers = append(answers, rr)
+				}
+			}
+			resp.Answer = answers
 			if len(resp.Answer) > 0 {
 				if isUnicastQuestion(q) {
 					// Send unicast
@@ -700,6 +717,34 @@ func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
 	}
 	_, err := s.ipv6conn.WriteToUDP(buf, addr)
 	return err
+}
+
+// sameRecord reports whether a and b have the same name, type, class and rdata
+func sameRecord(a, b dns.RR) bool {
+	ha, hb := a.Header(), b.Header()
+	if ha.Rrtype != hb.Rrtype || ha.Class&^cacheFlushBit != hb.Class&^cacheFlushBit ||
+		canonicalName(ha.Name) != canonicalName(hb.Name) {
+		return false
+	}
+	switch ra := a.(type) {
+	case *dns.PTR:
+		rb, ok := b.(*dns.PTR)
+		return ok && canonicalName(ra.Ptr) == canonicalName(rb.Ptr)
+	case *dns.SRV:
+		rb, ok := b.(*dns.SRV)
+		return ok && ra.Priority == rb.Priority && ra.Weight == rb.Weight && ra.Port == rb.Port &&
+			canonicalName(ra.Target) == canonicalName(rb.Target)
+	case *dns.TXT:
+		rb, ok := b.(*dns.TXT)
+		return ok && slices.Equal(ra.Txt, rb.Txt)
+	case *dns.A:
+		rb, ok := b.(*dns.A)
+		return ok && ra.A.Equal(rb.A)
+	case *dns.AAAA:
+		rb, ok := b.(*dns.AAAA)
+		return ok && ra.AAAA.Equal(rb.AAAA)
+	}
+	return false
 }
 
 func isUnicastQuestion(q dns.Question) bool {

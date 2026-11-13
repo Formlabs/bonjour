@@ -121,3 +121,71 @@ func TestCanonicalName(t *testing.T) {
 		}
 	}
 }
+
+func browseWithKnownAnswer(entry *ServiceEntry, instance string, ttl uint32) *dns.Msg {
+	q := new(dns.Msg)
+	q.Question = []dns.Question{question(entry.ServiceName(), dns.TypePTR, true)}
+	q.Answer = []dns.RR{&dns.PTR{
+		Hdr: dns.RR_Header{Name: entry.ServiceName(), Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttl},
+		Ptr: instance + "." + entry.ServiceName(),
+	}}
+	return q
+}
+
+func TestKnownAnswerSuppression(t *testing.T) {
+	entry := testEntry(t)
+	cases := []struct {
+		desc      string
+		instance  string
+		ttl       uint32
+		wantReply bool
+	}{
+		{"unrelated known answer", "Formlabs Form 4 Y", 300, true},
+		{"own PTR at full TTL", entry.Instance, 300, false},
+		{"own PTR at half TTL", strings.ToUpper(entry.Instance), 150, false},
+		{"own PTR below half TTL", entry.Instance, 100, true},
+	}
+	for _, c := range cases {
+		s, sent := testServer(t)
+		receive(t, s, entry, browseWithKnownAnswer(entry, c.instance, c.ttl), querier)
+		if got := len(*sent) == 1 && countTypes((*sent)[0].msg.Answer)[dns.TypePTR] == 1; got != c.wantReply {
+			t.Errorf("%s: PTR reply sent = %v, want %v", c.desc, got, c.wantReply)
+		}
+	}
+}
+
+// RFC 6762 11: a query sent to the multicast group is on the link whatever its source
+// address, so hosts on another subnet of the same link are answered too
+func TestSourcesOnOtherSubnetsAreAnswered(t *testing.T) {
+	entry := testEntry(t)
+	for _, from := range []string{"10.35.9.68", "192.168.1.20", "169.254.10.1", "fe80::2", "2001:db8::2"} {
+		s, sent := testServer(t)
+		q := new(dns.Msg)
+		q.Question = []dns.Question{question(entry.HostName, dns.TypeA, false)}
+		receive(t, s, entry, q, &net.UDPAddr{IP: net.ParseIP(from), Port: 5353})
+		if len(*sent) != 1 {
+			t.Errorf("query from %s: got %d replies, want 1", from, len(*sent))
+		}
+	}
+}
+
+func TestOnlyPlainQueriesAreAnswered(t *testing.T) {
+	entry := testEntry(t)
+	cases := []struct {
+		desc string
+		set  func(m *dns.Msg)
+	}{
+		{"response", func(m *dns.Msg) { m.Response = true }},
+		{"non-zero opcode", func(m *dns.Msg) { m.Opcode = dns.OpcodeUpdate }},
+		{"non-zero response code", func(m *dns.Msg) { m.Rcode = dns.RcodeServerFailure }},
+	}
+	for _, c := range cases {
+		s, sent := testServer(t)
+		m := browseWithKnownAnswer(entry, "Formlabs Form 4 Y", 300)
+		c.set(m)
+		receive(t, s, entry, m, querier)
+		if len(*sent) != 0 {
+			t.Errorf("%s: got %d replies, want 0", c.desc, len(*sent))
+		}
+	}
+}
