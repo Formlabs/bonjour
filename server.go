@@ -108,6 +108,8 @@ type Server struct {
 	waitGroup         sync.WaitGroup
 	shutdownLock      sync.Mutex
 	ttl               uint32
+	// send writes a packet to addr, or to both multicast groups when addr is nil
+	send func(buf []byte, addr *net.UDPAddr) error
 }
 
 // Constructs server structure
@@ -175,6 +177,7 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 		shutdownChan: make(chan bool),
 		initialEntry: initialEntry,
 	}
+	s.send = s.writePacket
 
 	return s, nil
 }
@@ -670,31 +673,35 @@ func (s *Server) unicastResponse(resp *dns.Msg, from net.Addr) error {
 	if err != nil {
 		return err
 	}
-	addr := from.(*net.UDPAddr)
-	if addr.IP.To4() != nil {
-		_, err = s.ipv4conn.WriteToUDP(buf, addr)
-		return err
-	} else {
-		_, err = s.ipv6conn.WriteToUDP(buf, addr)
-		return err
-	}
+	return s.send(buf, from.(*net.UDPAddr))
 }
 
 // multicastResponse us used to send a multicast response packet
-func (c *Server) multicastResponse(msg *dns.Msg) error {
+func (s *Server) multicastResponse(msg *dns.Msg) error {
 	buf, err := msg.Pack()
-
 	if err != nil {
 		log.Println("Failed to pack message!")
 		return err
 	}
-	if c.ipv4conn != nil {
-		c.ipv4conn.WriteTo(buf, ipv4Addr)
+	return s.send(buf, nil)
+}
+
+func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
+	if addr == nil {
+		if s.ipv4conn != nil {
+			s.ipv4conn.WriteTo(buf, ipv4Addr)
+		}
+		if s.ipv6conn != nil {
+			s.ipv6conn.WriteTo(buf, ipv6Addr)
+		}
+		return nil
 	}
-	if c.ipv6conn != nil {
-		c.ipv6conn.WriteTo(buf, ipv6Addr)
+	if addr.IP.To4() != nil {
+		_, err := s.ipv4conn.WriteToUDP(buf, addr)
+		return err
 	}
-	return nil
+	_, err := s.ipv6conn.WriteToUDP(buf, addr)
+	return err
 }
 
 func isUnicastQuestion(q dns.Question) bool {
