@@ -244,6 +244,7 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
+			resp.MsgHdr.Authoritative = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 
@@ -389,7 +390,8 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 	if len(request.query.Question) > 0 {
 		for _, q := range request.query.Question {
 			resp = dns.Msg{}
-			resp.SetReply(&request.query)
+			resp.Response = true
+			resp.Authoritative = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 			if err = s.handleQuestion(q, service, &resp); err != nil {
@@ -463,7 +465,6 @@ func (s *Server) composeHostAnswers(service *ServiceEntry, resp *dns.Msg, ttl ui
 		}
 		resp.Answer = append(resp.Answer, aaaa)
 	}
-	resp.Question = make([]dns.Question, 0)
 }
 
 func (s *Server) composeBrowsingAnswers(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
@@ -596,7 +597,6 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, resp *dns.Msg, ttl 
 		}
 		resp.Extra = append(resp.Extra, aaaa)
 	}
-	resp.Question = make([]dns.Question, 0)
 }
 
 func (s *Server) serviceTypeName(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
@@ -624,6 +624,7 @@ func (s *Server) serviceTypeName(service *ServiceEntry, resp *dns.Msg, ttl uint3
 func (s *Server) announceText(service *ServiceEntry) {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
+	resp.MsgHdr.Authoritative = true
 
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
@@ -642,6 +643,7 @@ func (s *Server) announceText(service *ServiceEntry) {
 func (s *Server) unregister(service *ServiceEntry) error {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
+	resp.MsgHdr.Authoritative = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
 	s.composeLookupAnswers(service, resp, 0)

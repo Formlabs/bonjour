@@ -254,3 +254,28 @@ func TestCacheFlushOnUniqueRecordsOnly(t *testing.T) {
 		}
 	}
 }
+
+// RFC 6762 18: a response has QR and AA set, a zero ID and no question section
+func TestResponseHeader(t *testing.T) {
+	entry := testEntry(t)
+	for _, unicast := range []bool{true, false} {
+		s, sent := testServer(t)
+		q := new(dns.Msg)
+		q.Id = 1234
+		q.Question = []dns.Question{question(entry.HostName, dns.TypeA, unicast)}
+		receive(t, s, entry, q, querier)
+		if len(*sent) != 1 {
+			t.Fatalf("unicast %v: got %d replies, want 1", unicast, len(*sent))
+		}
+		p := (*sent)[0]
+		if !p.msg.Response || !p.msg.Authoritative || p.msg.Opcode != dns.OpcodeQuery {
+			t.Errorf("unicast %v: header %+v, want QR and AA set and opcode 0", unicast, p.msg.MsgHdr)
+		}
+		if (p.to != nil) != unicast {
+			t.Errorf("unicast %v: sent to %v", unicast, p.to)
+		}
+		if p.msg.Id != 0 || len(p.msg.Question) != 0 {
+			t.Errorf("unicast %v: id %d and %d questions, want 0 and 0", unicast, p.msg.Id, len(p.msg.Question))
+		}
+	}
+}
