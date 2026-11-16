@@ -109,6 +109,13 @@ const announceCount = 4
 type Server struct {
 	// The wait before the first announcement and between the first two. Later waits double.
 	announceInterval time.Duration
+	// The sockets as packet connections, for joining groups and choosing the interface
+	// a multicast packet leaves on, and the interface the server is limited to, if any
+	p4    *ipv4.PacketConn
+	p6    *ipv6.PacketConn
+	iface *net.Interface
+	// Interface names on which the groups were joined. Owned by mainloop once it runs.
+	joined4, joined6 map[string]bool
 	ipv4conn          *net.UDPConn
 	ipv6conn          *net.UDPConn
 	initialEntry      *ServiceEntry
@@ -153,51 +160,70 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 			log.Printf("[ERR] bonjour: Failed to set udp6 socket options: %v", err)
 		}
 	}
-	if iface != nil {
-		if p1 != nil {
-			if err := p1.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-				return nil, err
-			}
-		}
-		if p2 != nil {
-			if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-				return nil, err
-			}
-		}
-	} else {
-		ifaces, err := net.Interfaces()
-		if err != nil {
-			return nil, err
-		}
-		errCount1, errCount2 := 0, 0
-		for _, iface := range ifaces {
-			if p1 != nil {
-				if err := p1.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-					errCount1++
-				}
-			}
-			if p2 != nil {
-				if err := p2.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-					errCount2++
-				}
-			}
-		}
-		if len(ifaces) == errCount1 && len(ifaces) == errCount2 {
-			return nil, fmt.Errorf("failed to join multicast group on all interfaces")
-		}
-	}
-
 	s := &Server{
-		ipv4conn:     ipv4conn,
-		ipv6conn:     ipv6conn,
-		ttl:          60 * 5,
+		ipv4conn:         ipv4conn,
+		ipv6conn:         ipv6conn,
+		p4:               p1,
+		p6:               p2,
+		iface:            iface,
+		joined4:          map[string]bool{},
+		joined6:          map[string]bool{},
+		ttl:              60 * 5,
 		announceInterval: time.Second,
-		shutdownChan: make(chan bool),
-		initialEntry: initialEntry,
+		shutdownChan:     make(chan bool),
+		initialEntry:     initialEntry,
+	}
+	if !s.joinGroups() {
+		return nil, fmt.Errorf("failed to join multicast group on all interfaces")
 	}
 	s.send = s.writePacket
 
 	return s, nil
+}
+
+// multicastInterfaces returns the interfaces the server works on: the one it was
+// given, or every interface the host has at this moment
+func (s *Server) multicastInterfaces() []net.Interface {
+	if s.iface != nil {
+		return []net.Interface{*s.iface}
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("[ERR] bonjour: Failed to list interfaces: %v", err)
+	}
+	return ifaces
+}
+
+// joinGroups joins the mDNS groups on the server's interfaces and reports whether it
+// is a member on any. It runs when the server starts and again whenever the records
+// change: an interface that had no address at the start, or did not exist yet, such
+// as Wi-Fi joined after boot, could not be joined then, and its queries would never
+// reach us. Joining an interface a second time fails, which does no harm.
+func (s *Server) joinGroups() bool {
+	joined := false
+	for _, ifi := range s.multicastInterfaces() {
+		if s.p4 != nil {
+			err := s.p4.JoinGroup(&ifi, &net.UDPAddr{IP: mdnsGroupIPv4})
+			if err == nil && !s.joined4[ifi.Name] {
+				log.Printf("bonjour: joined the IPv4 mDNS group on %s", ifi.Name)
+			}
+			if err == nil {
+				s.joined4[ifi.Name] = true
+			}
+			joined = joined || s.joined4[ifi.Name]
+		}
+		if s.p6 != nil {
+			err := s.p6.JoinGroup(&ifi, &net.UDPAddr{IP: mdnsGroupIPv6})
+			if err == nil && !s.joined6[ifi.Name] {
+				log.Printf("bonjour: joined the IPv6 mDNS group on %s", ifi.Name)
+			}
+			if err == nil {
+				s.joined6[ifi.Name] = true
+			}
+			joined = joined || s.joined6[ifi.Name]
+		}
+	}
+	return joined
 }
 
 // Shutdown closes all udp connections and unregisters the service
@@ -258,6 +284,8 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 				}
 			}
 			timer.Reset(wait)
+			// the addresses changed, so an interface may have come up
+			s.joinGroups()
 
 		case <-timer.C:
 			resp := new(dns.Msg)
@@ -707,6 +735,30 @@ func (s *Server) multicastResponse(msg *dns.Msg) error {
 
 func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
 	if addr == nil {
+		// Multicast on every interface that is up. Left to the routing table, a
+		// multicast packet leaves on one interface only, and a printer on both
+		// Ethernet and Wi-Fi would announce itself and answer on just one of them.
+		sent := false
+		for _, ifi := range s.multicastInterfaces() {
+			const want = net.FlagUp | net.FlagMulticast
+			if ifi.Flags&want != want || ifi.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			if s.p4 != nil {
+				if _, err := s.p4.WriteTo(buf, &ipv4.ControlMessage{IfIndex: ifi.Index}, ipv4Addr); err == nil {
+					sent = true
+				}
+			}
+			if s.p6 != nil {
+				if _, err := s.p6.WriteTo(buf, &ipv6.ControlMessage{IfIndex: ifi.Index}, ipv6Addr); err == nil {
+					sent = true
+				}
+			}
+		}
+		if sent {
+			return nil
+		}
+		// no interface took the packet: fall back on the routing table's choice
 		if s.ipv4conn != nil {
 			s.ipv4conn.WriteTo(buf, ipv4Addr)
 		}
