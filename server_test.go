@@ -279,3 +279,34 @@ func TestResponseHeader(t *testing.T) {
 		}
 	}
 }
+
+// A querier that knows more printers than fit in one packet sets the TC bit and lists
+// the rest in further packets. Such a query is answered, with the known answers it
+// holds itself applied, and the packets that continue it are not answered.
+func TestTruncatedQueriesAreAnswered(t *testing.T) {
+	entry := testEntry(t)
+	for _, c := range []struct {
+		desc     string
+		instance string
+		want     int
+	}{
+		{"our record not among the known answers", "Formlabs Form 4 Other", 1},
+		{"our record among the known answers", entry.Instance, 0},
+	} {
+		s, sent := testServer(t)
+		q := browseWithKnownAnswer(entry, c.instance, 300)
+		q.Truncated = true
+		receive(t, s, entry, q, querier)
+		if len(*sent) != c.want {
+			t.Errorf("%s: got %d replies, want %d", c.desc, len(*sent), c.want)
+		}
+		// the continuation holds known answers and no question
+		*sent = nil
+		cont := browseWithKnownAnswer(entry, "Formlabs Form 4 Another", 300)
+		cont.Question = nil
+		receive(t, s, entry, cont, querier)
+		if len(*sent) != 0 {
+			t.Errorf("%s: got %d replies to the continuation packet, want 0", c.desc, len(*sent))
+		}
+	}
+}

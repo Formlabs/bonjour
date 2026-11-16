@@ -389,14 +389,14 @@ func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
 func (s *Server) parsePacket(packet []byte, from net.Addr) (*Request, error) {
 	var request Request
 	request.from = from
-	if err := request.query.Unpack(packet); err != nil {
-		if err != dns.ErrTruncated {
-			log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
-		}
+	// ErrTruncated only reports the TC bit; the message is fully unpacked. A truncated
+	// query is answered like any other. Its known answers go on in further packets,
+	// which are not waited for: at worst we repeat an answer the querier listed there.
+	if err := request.query.Unpack(packet); err != nil && err != dns.ErrTruncated {
+		log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
 		return nil, err
-	} else {
-		return &request, nil
 	}
+	return &request, nil
 }
 
 // handleQuery is used to handle an incoming query
