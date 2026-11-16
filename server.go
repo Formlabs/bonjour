@@ -109,6 +109,9 @@ const announceCount = 4
 type Server struct {
 	// The wait before the first announcement and between the first two. Later waits double.
 	announceInterval time.Duration
+	// How often the records are announced again once the announcements above are
+	// done. Zero for never. See mainloop for why this exists.
+	keepAliveInterval time.Duration
 	// The sockets as packet connections, for joining groups and choosing the interface
 	// a multicast packet leaves on, and the interface the server is limited to, if any
 	p4    *ipv4.PacketConn
@@ -116,14 +119,14 @@ type Server struct {
 	iface *net.Interface
 	// Interface names on which the groups were joined. Owned by mainloop once it runs.
 	joined4, joined6 map[string]bool
-	ipv4conn          *net.UDPConn
-	ipv6conn          *net.UDPConn
-	initialEntry      *ServiceEntry
-	shouldShutdown    bool
-	shutdownChan      chan bool
-	waitGroup         sync.WaitGroup
-	shutdownLock      sync.Mutex
-	ttl               uint32
+	ipv4conn         *net.UDPConn
+	ipv6conn         *net.UDPConn
+	initialEntry     *ServiceEntry
+	shouldShutdown   bool
+	shutdownChan     chan bool
+	waitGroup        sync.WaitGroup
+	shutdownLock     sync.Mutex
+	ttl              uint32
 	// send writes a packet to addr, or to both multicast groups when addr is nil
 	send func(buf []byte, addr *net.UDPAddr) error
 }
@@ -161,17 +164,18 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 		}
 	}
 	s := &Server{
-		ipv4conn:         ipv4conn,
-		ipv6conn:         ipv6conn,
-		p4:               p1,
-		p6:               p2,
-		iface:            iface,
-		joined4:          map[string]bool{},
-		joined6:          map[string]bool{},
-		ttl:              60 * 5,
-		announceInterval: time.Second,
-		shutdownChan:     make(chan bool),
-		initialEntry:     initialEntry,
+		ipv4conn:          ipv4conn,
+		ipv6conn:          ipv6conn,
+		p4:                p1,
+		p6:                p2,
+		iface:             iface,
+		joined4:           map[string]bool{},
+		joined6:           map[string]bool{},
+		ttl:               60 * 5,
+		announceInterval:  time.Second,
+		keepAliveInterval: 150 * time.Second,
+		shutdownChan:      make(chan bool),
+		initialEntry:      initialEntry,
 	}
 	if !s.joinGroups() {
 		return nil, fmt.Errorf("failed to join multicast group on all interfaces")
@@ -262,8 +266,14 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 	//    at least a factor of two with every response sent.
 	//
 	// The records are announced announceCount times when the server starts and again
-	// whenever they change, 1, 2, 4 and 8 intervals after that moment. Then the
-	// announcing stops: from there on the records are sent in answer to queries only.
+	// whenever they change, 1, 2, 4 and 8 intervals after that moment. From there on
+	// they are sent in answer to queries, and once every keepAliveInterval.
+	//
+	// The keep-alive is a hedge. On networks that drop most multicast packets on the
+	// way to clients (e.g. observed at Formlabs HQ on Wi-Fi), a client can miss both the
+	// announcements and the answers to its queries, and before fixing FE-29496 the endless
+	// announcing covered for that. If answers to queries prove enough on such networks,
+	// the keep-alive can go.
 	remaining := announceCount
 	wait := s.announceInterval
 	timer := time.NewTimer(wait)
@@ -299,9 +309,14 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
 			}
-			if remaining--; remaining > 0 {
+			if remaining > 0 {
+				remaining--
+			}
+			if remaining > 0 {
 				timer.Reset(wait)
 				wait *= 2
+			} else if s.keepAliveInterval > 0 {
+				timer.Reset(s.keepAliveInterval)
 			}
 
 		case req := <-requests:

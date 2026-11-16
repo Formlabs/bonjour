@@ -398,3 +398,49 @@ func TestAnnouncementsStop(t *testing.T) {
 		t.Errorf("%d announcements after a change in mid-burst, want %d", n-during, announceCount)
 	}
 }
+
+// Once the announcements are done the records are repeated at the keep-alive interval,
+// and a change of the records starts over with the announcements
+func TestKeepAliveAnnouncements(t *testing.T) {
+	entry := testEntry(t)
+	const interval = 20 * time.Millisecond
+	const keepAlive = 10 * interval
+	var mu sync.Mutex
+	var times []time.Time
+	s := &Server{ttl: 300, announceInterval: interval, keepAliveInterval: keepAlive, initialEntry: entry, shutdownChan: make(chan bool)}
+	s.send = func(buf []byte, addr *net.UDPAddr) error {
+		mu.Lock()
+		defer mu.Unlock()
+		times = append(times, time.Now())
+		return nil
+	}
+	sent := func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(times)
+	}
+	entries := make(chan *ServiceEntry)
+	s.waitGroup.Add(1)
+	go s.mainloop(entries)
+	defer func() { s.shutdownChan <- true }()
+
+	// the announcements end 8 intervals after the start; keep-alives follow 10 intervals apart
+	time.Sleep(8*interval + 2*keepAlive + keepAlive/2)
+	got := sent()
+	if n := len(got) - announceCount; n < 2 || n > 3 {
+		t.Fatalf("%d keep-alive announcements in two and a half keep-alive intervals, want 2", n)
+	}
+	for i := announceCount; i < len(got); i++ {
+		if gap := got[i].Sub(got[i-1]); gap < keepAlive {
+			t.Errorf("keep-alive %d came %v after the announcement before it, want at least %v", i-announceCount, gap, keepAlive)
+		}
+	}
+
+	// a change announces afresh: four announcements within 8 intervals, less than one keep-alive
+	before := len(sent())
+	entries <- entry
+	time.Sleep(9 * interval)
+	if n := len(sent()) - before; n != announceCount {
+		t.Errorf("%d announcements in the 9 intervals after a change, want %d", n, announceCount)
+	}
+}
