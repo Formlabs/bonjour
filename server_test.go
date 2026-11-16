@@ -2,8 +2,11 @@ package bonjour
 
 import (
 	"net"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Formlabs/dns"
 )
@@ -308,5 +311,90 @@ func TestTruncatedQueriesAreAnswered(t *testing.T) {
 		if len(*sent) != 0 {
 			t.Errorf("%s: got %d replies to the continuation packet, want 0", c.desc, len(*sent))
 		}
+	}
+}
+
+// The records are announced four times when the server starts and four times more
+// when they change, and not again after that
+func TestAnnouncementsStop(t *testing.T) {
+	entry := testEntry(t)
+	const interval = 20 * time.Millisecond
+	var mu sync.Mutex
+	var sent []dns.Msg
+	var times []time.Time
+	s := &Server{ttl: 300, announceInterval: interval, initialEntry: entry, shutdownChan: make(chan bool)}
+	s.send = func(buf []byte, addr *net.UDPAddr) error {
+		var m dns.Msg
+		if err := m.Unpack(buf); err != nil {
+			t.Error(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		sent = append(sent, m)
+		times = append(times, time.Now())
+		return nil
+	}
+	addresses := func(from, to int) (ips []string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if len(sent) < to {
+			t.Fatalf("%d announcements sent, want at least %d", len(sent), to)
+		}
+		for _, m := range sent[from:to] {
+			for _, rr := range m.Extra {
+				if a, ok := rr.(*dns.A); ok {
+					ips = append(ips, a.A.String())
+				}
+			}
+		}
+		return ips
+	}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(sent)
+	}
+
+	entries := make(chan *ServiceEntry)
+	s.waitGroup.Add(1)
+	start := time.Now()
+	go s.mainloop(entries)
+	defer func() { s.shutdownChan <- true }()
+
+	// the burst ends 8 intervals after the start; nothing follows in the next 17
+	time.Sleep(25 * interval)
+	if n := count(); n != announceCount {
+		t.Fatalf("%d announcements after the first burst, want %d", n, announceCount)
+	}
+	if ips := addresses(0, 4); !slices.Equal(ips, []string{"10.35.15.50", "10.35.15.50", "10.35.15.50", "10.35.15.50"}) {
+		t.Errorf("first burst announced addresses %v", ips)
+	}
+	mu.Lock()
+	for i, want := range []time.Duration{1, 2, 4, 8} {
+		if got := times[i].Sub(start); got < want*interval {
+			t.Errorf("announcement %d sent after %v, want at least %v", i, got, want*interval)
+		}
+	}
+	mu.Unlock()
+
+	changed := testEntry(t)
+	changed.AddrsIPv4 = []net.IP{net.ParseIP("10.35.15.51").To4()}
+	entries <- changed
+	time.Sleep(25 * interval)
+	if n := count(); n != 2*announceCount {
+		t.Fatalf("%d announcements after the records changed, want %d", n, 2*announceCount)
+	}
+	if ips := addresses(4, 8); !slices.Equal(ips, []string{"10.35.15.51", "10.35.15.51", "10.35.15.51", "10.35.15.51"}) {
+		t.Errorf("second burst announced addresses %v", ips)
+	}
+
+	// a change in the middle of a burst starts the burst over with the new records
+	entries <- entry
+	time.Sleep(3 * interval)
+	during := count()
+	entries <- changed
+	time.Sleep(25 * interval)
+	if n := count(); n != during+announceCount {
+		t.Errorf("%d announcements after a change in mid-burst, want %d", n-during, announceCount)
 	}
 }

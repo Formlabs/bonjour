@@ -102,8 +102,13 @@ func RegisterProxy(initialEntry *ServiceEntry, entries chan *ServiceEntry, iface
 	return s, nil
 }
 
+// How many times the records are announced when the server starts or they change
+const announceCount = 4
+
 // Server structure incapsulates both IPv4/IPv6 UDP connections
 type Server struct {
+	// The wait before the first announcement and between the first two. Later waits double.
+	announceInterval time.Duration
 	ipv4conn          *net.UDPConn
 	ipv6conn          *net.UDPConn
 	initialEntry      *ServiceEntry
@@ -186,6 +191,7 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 		ipv4conn:     ipv4conn,
 		ipv6conn:     ipv6conn,
 		ttl:          60 * 5,
+		announceInterval: time.Second,
 		shutdownChan: make(chan bool),
 		initialEntry: initialEntry,
 	}
@@ -228,29 +234,32 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 	//    packet loss, a responder MAY send up to eight unsolicited responses,
 	//    provided that the interval between unsolicited responses increases by
 	//    at least a factor of two with every response sent.
-	timeout := 1 * time.Second
-	ticker := time.NewTicker(timeout)
-
-	i := 0
+	//
+	// The records are announced announceCount times when the server starts and again
+	// whenever they change, 1, 2, 4 and 8 intervals after that moment. Then the
+	// announcing stops: from there on the records are sent in answer to queries only.
+	remaining := announceCount
+	wait := s.announceInterval
+	timer := time.NewTimer(wait)
 
 	for {
 		select {
 		case <-s.shutdownChan:
-			ticker.Stop()
+			timer.Stop()
 			return
 
 		case entry = <-entries:
-			i = 0
-			timeout = 1 * time.Second
-			break
-
-		case <-ticker.C:
-			i++
-			if i > 3 {
-				timeout = 1 * time.Second
-				i = 0
+			remaining = announceCount
+			wait = s.announceInterval
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
+			timer.Reset(wait)
 
+		case <-timer.C:
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
 			resp.MsgHdr.Authoritative = true
@@ -262,11 +271,10 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
 			}
-			ticker.Stop()
-			ticker = time.NewTicker(timeout)
-			timeout *= 2
-			break
-
+			if remaining--; remaining > 0 {
+				timer.Reset(wait)
+				wait *= 2
+			}
 
 		case req := <-requests:
 			s.handleQuery(entry, req)
