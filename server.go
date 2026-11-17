@@ -1,9 +1,11 @@
 package bonjour
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -13,6 +15,8 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
+
+const cacheFlushBit = 1 << 15
 
 var (
 	// Multicast groups used by mDNS
@@ -98,16 +102,38 @@ func RegisterProxy(initialEntry *ServiceEntry, entries chan *ServiceEntry, iface
 	return s, nil
 }
 
+// How many times the records are announced when the server starts or they change
+const announceCount = 4
+
 // Server structure incapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	ipv4conn          *net.UDPConn
-	ipv6conn          *net.UDPConn
-	initialEntry      *ServiceEntry
-	shouldShutdown    bool
-	shutdownChan      chan bool
-	waitGroup         sync.WaitGroup
-	shutdownLock      sync.Mutex
-	ttl               uint32
+	// The wait before the first announcement and between the first two. Later waits double.
+	announceInterval time.Duration
+	// How often the records are announced again once the announcements above are
+	// done. Zero for never. See mainloop for why this exists.
+	keepAliveInterval time.Duration
+	// The sockets as packet connections, for joining groups and choosing the interface
+	// a multicast packet leaves on, and the interface the server is limited to, if any
+	p4    *ipv4.PacketConn
+	p6    *ipv6.PacketConn
+	iface *net.Interface
+	// Interface names on which the groups were joined. Owned by mainloop once it runs.
+	joined4, joined6 map[string]bool
+	// Truncated queries waiting for the rest of their known answers, by querier address,
+	// and the timer for the one due first. Owned by mainloop.
+	held      map[string]*heldQuery
+	heldTimer <-chan time.Time
+	ipv4conn         *net.UDPConn
+	ipv6conn         *net.UDPConn
+	initialEntry     *ServiceEntry
+	shouldShutdown   bool
+	shutdownChan     chan bool
+	waitGroup        sync.WaitGroup
+	shutdownLock     sync.Mutex
+	ttl              uint32
+	// send writes a packet to addr, which is a querier or one of the mDNS groups, or to
+	// both groups when addr is nil
+	send func(buf []byte, addr *net.UDPAddr) error
 }
 
 // Constructs server structure
@@ -128,55 +154,85 @@ func newServer(initialEntry *ServiceEntry, iface *net.Interface) (*Server, error
 	// Join multicast groups to receive announcements
 	var p1 *ipv4.PacketConn
 	var p2 *ipv6.PacketConn
+	// RFC 6762 11: send with IP TTL 255. Multicast loopback stays on: other mDNS
+	// software on this host only hears us through it.
 	if ipv4conn != nil {
 		p1 = ipv4.NewPacketConn(ipv4conn)
+		if err := errors.Join(p1.SetTTL(255), p1.SetMulticastTTL(255)); err != nil {
+			log.Printf("[ERR] bonjour: Failed to set udp4 socket options: %v", err)
+		}
 	}
 	if ipv6conn != nil {
 		p2 = ipv6.NewPacketConn(ipv6conn)
-	}
-	if iface != nil {
-		if p1 != nil {
-			if err := p1.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-				return nil, err
-			}
-		}
-		if p2 != nil {
-			if err := p2.JoinGroup(iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-				return nil, err
-			}
-		}
-	} else {
-		ifaces, err := net.Interfaces()
-		if err != nil {
-			return nil, err
-		}
-		errCount1, errCount2 := 0, 0
-		for _, iface := range ifaces {
-			if p1 != nil {
-				if err := p1.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-					errCount1++
-				}
-			}
-			if p2 != nil {
-				if err := p2.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-					errCount2++
-				}
-			}
-		}
-		if len(ifaces) == errCount1 && len(ifaces) == errCount2 {
-			return nil, fmt.Errorf("failed to join multicast group on all interfaces")
+		if err := errors.Join(p2.SetHopLimit(255), p2.SetMulticastHopLimit(255)); err != nil {
+			log.Printf("[ERR] bonjour: Failed to set udp6 socket options: %v", err)
 		}
 	}
-
 	s := &Server{
-		ipv4conn:     ipv4conn,
-		ipv6conn:     ipv6conn,
-		ttl:          60 * 5,
-		shutdownChan: make(chan bool),
-		initialEntry: initialEntry,
+		ipv4conn:          ipv4conn,
+		ipv6conn:          ipv6conn,
+		p4:                p1,
+		p6:                p2,
+		iface:             iface,
+		joined4:           map[string]bool{},
+		joined6:           map[string]bool{},
+		ttl:               60 * 5,
+		announceInterval:  time.Second,
+		keepAliveInterval: 150 * time.Second,
+		shutdownChan:      make(chan bool),
+		initialEntry:      initialEntry,
 	}
+	if !s.joinGroups() {
+		return nil, fmt.Errorf("failed to join multicast group on all interfaces")
+	}
+	s.send = s.writePacket
 
 	return s, nil
+}
+
+// multicastInterfaces returns the interfaces the server works on: the one it was
+// given, or every interface the host has at this moment
+func (s *Server) multicastInterfaces() []net.Interface {
+	if s.iface != nil {
+		return []net.Interface{*s.iface}
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("[ERR] bonjour: Failed to list interfaces: %v", err)
+	}
+	return ifaces
+}
+
+// joinGroups joins the mDNS groups on the server's interfaces and reports whether it
+// is a member on any. It runs when the server starts and again whenever the records
+// change: an interface that had no address at the start, or did not exist yet, such
+// as Wi-Fi joined after boot, could not be joined then, and its queries would never
+// reach us. Joining an interface a second time fails, which does no harm.
+func (s *Server) joinGroups() bool {
+	joined := false
+	for _, ifi := range s.multicastInterfaces() {
+		if s.p4 != nil {
+			err := s.p4.JoinGroup(&ifi, &net.UDPAddr{IP: mdnsGroupIPv4})
+			if err == nil && !s.joined4[ifi.Name] {
+				log.Printf("bonjour: joined the IPv4 mDNS group on %s", ifi.Name)
+			}
+			if err == nil {
+				s.joined4[ifi.Name] = true
+			}
+			joined = joined || s.joined4[ifi.Name]
+		}
+		if s.p6 != nil {
+			err := s.p6.JoinGroup(&ifi, &net.UDPAddr{IP: mdnsGroupIPv6})
+			if err == nil && !s.joined6[ifi.Name] {
+				log.Printf("bonjour: joined the IPv6 mDNS group on %s", ifi.Name)
+			}
+			if err == nil {
+				s.joined6[ifi.Name] = true
+			}
+			joined = joined || s.joined6[ifi.Name]
+		}
+	}
+	return joined
 }
 
 // Shutdown closes all udp connections and unregisters the service
@@ -213,47 +269,66 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 	//    packet loss, a responder MAY send up to eight unsolicited responses,
 	//    provided that the interval between unsolicited responses increases by
 	//    at least a factor of two with every response sent.
-	timeout := 1 * time.Second
-	ticker := time.NewTicker(timeout)
-
-	i := 0
+	//
+	// The records are announced announceCount times when the server starts and again
+	// whenever they change, 1, 2, 4 and 8 intervals after that moment. From there on
+	// they are sent in answer to queries, and once every keepAliveInterval.
+	//
+	// The keep-alive is a hedge. On networks that drop most multicast packets on the
+	// way to clients (e.g. observed at Formlabs HQ on Wi-Fi), a client can miss both the
+	// announcements and the answers to its queries, and before fixing FE-29496 the endless
+	// announcing covered for that. If answers to queries prove enough on such networks,
+	// the keep-alive can go.
+	remaining := announceCount
+	wait := s.announceInterval
+	timer := time.NewTimer(wait)
 
 	for {
 		select {
 		case <-s.shutdownChan:
-			ticker.Stop()
+			timer.Stop()
 			return
 
 		case entry = <-entries:
-			i = 0
-			timeout = 1 * time.Second
-			break
-
-		case <-ticker.C:
-			i++
-			if i > 3 {
-				timeout = 1 * time.Second
-				i = 0
+			remaining = announceCount
+			wait = s.announceInterval
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
+			timer.Reset(wait)
+			// the addresses changed, so an interface may have come up
+			s.joinGroups()
 
+		case <-timer.C:
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
+			resp.MsgHdr.Authoritative = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 
-			s.composeLookupAnswers(entry, true, resp, s.ttl)
+			s.composeLookupAnswers(entry, resp, s.ttl)
 
 			if err := s.multicastResponse(resp); err != nil {
 				log.Println("[ERR] bonjour: failed to send announcement:", err.Error())
 			}
-			ticker.Stop()
-			ticker = time.NewTicker(timeout)
-			timeout *= 2
-			break
-
+			if remaining > 0 {
+				remaining--
+			}
+			if remaining > 0 {
+				timer.Reset(wait)
+				wait *= 2
+			} else if s.keepAliveInterval > 0 {
+				timer.Reset(s.keepAliveInterval)
+			}
 
 		case req := <-requests:
-			s.handleQuery(entry, req)
+			s.accept(entry, req, time.Now())
+
+		case <-s.heldTimer:
+			s.answerHeld(entry, time.Now())
 		}
 	}
 }
@@ -312,6 +387,9 @@ func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
 		println("Could not set buffer size", e)
 	}
 	buf := make([]byte, 65536)
+	// Interface names by index. Dropped every minute so a renamed or replaced interface is noticed.
+	zones := map[uint32]string{}
+	zonesRead := time.Now()
 
 	i := 0
 	bytes := 0
@@ -324,6 +402,22 @@ func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
 			from = &net.UDPAddr{IP: sa.Addr[0:], Port: sa.Port}
 		case *syscall.SockaddrInet6:
 			from = &net.UDPAddr{IP: sa.Addr[0:], Port: sa.Port}
+			// Unicast replies to link-local sources need the zone to pick the interface
+			if sa.ZoneId != 0 {
+				if time.Since(zonesRead) > time.Minute {
+					clear(zones)
+					zonesRead = time.Now()
+				}
+				name, ok := zones[sa.ZoneId]
+				if !ok {
+					// a failed lookup is remembered too, as the empty name, so it is not repeated for every packet
+					if ifi, err := net.InterfaceByIndex(int(sa.ZoneId)); err == nil {
+						name = ifi.Name
+					}
+					zones[sa.ZoneId] = name
+				}
+				from.Zone = name
+			}
 		}
 
 		if err != nil {
@@ -354,20 +448,104 @@ func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
 func (s *Server) parsePacket(packet []byte, from net.Addr) (*Request, error) {
 	var request Request
 	request.from = from
-	if err := request.query.Unpack(packet); err != nil {
-		if err != dns.ErrTruncated {
-			log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
-		}
+	// ErrTruncated only reports the TC bit; the message is fully unpacked
+	if err := request.query.Unpack(packet); err != nil && err != dns.ErrTruncated {
+		log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
 		return nil, err
-	} else {
-		return &request, nil
 	}
+	return &request, nil
+}
+
+// How long a truncated query waits for the packets that continue its known-answer
+// list (RFC 6762 7.2 asks for 400-500 ms), the longest it waits when those packets
+// are truncated themselves, and how many queriers may be waiting at once
+const (
+	truncatedWait    = 450 * time.Millisecond
+	truncatedMaxWait = 2 * time.Second
+	maxHeldQueries   = 64
+)
+
+// heldQuery is a truncated query waiting for the rest of its known answers
+type heldQuery struct {
+	request *Request
+	// when to answer, and the latest that further truncated packets may put that off to
+	due, latest time.Time
+}
+
+// accept takes in a packet received at now. A query is answered at once unless it is
+// truncated: a querier that knows more records than fit in one packet sets the TC bit
+// and lists the rest in packets without a question. Answering before those arrive
+// would repeat records the querier is about to say it has, on every query, for as
+// long as its list does not fit. Such a query is held until the list is complete.
+//
+// Each querier's query is held on its own, so one querier's wait delays nobody else.
+func (s *Server) accept(service *ServiceEntry, request *Request, now time.Time) {
+	q := &request.query
+	if q.Response || q.Opcode != dns.OpcodeQuery || q.Rcode != dns.RcodeSuccess {
+		return
+	}
+	from := request.from.String()
+	if h := s.held[from]; h != nil {
+		if len(q.Question) == 0 {
+			// the next part of the known-answer list
+			h.request.query.Answer = append(h.request.query.Answer, q.Answer...)
+			if q.Truncated {
+				h.due = minTime(now.Add(truncatedWait), h.latest)
+				s.armHeld(now)
+			}
+			return
+		}
+		// a new query from the querier: the list of the held one is not going to be continued
+		delete(s.held, from)
+		s.handleQuery(service, h.request)
+	}
+	if !q.Truncated || len(q.Question) == 0 || len(s.held) >= maxHeldQueries {
+		s.handleQuery(service, request)
+		return
+	}
+	if s.held == nil {
+		s.held = map[string]*heldQuery{}
+	}
+	s.held[from] = &heldQuery{request: request, due: now.Add(truncatedWait), latest: now.Add(truncatedMaxWait)}
+	s.armHeld(now)
+}
+
+// answerHeld answers the held queries whose wait is over at now
+func (s *Server) answerHeld(service *ServiceEntry, now time.Time) {
+	for from, h := range s.held {
+		if !h.due.After(now) {
+			delete(s.held, from)
+			s.handleQuery(service, h.request)
+		}
+	}
+	s.armHeld(now)
+}
+
+// armHeld sets the timer for the held query that is due first
+func (s *Server) armHeld(now time.Time) {
+	s.heldTimer = nil
+	var first time.Time
+	for _, h := range s.held {
+		if first.IsZero() || h.due.Before(first) {
+			first = h.due
+		}
+	}
+	if !first.IsZero() {
+		s.heldTimer = time.After(first.Sub(now))
+	}
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 // handleQuery is used to handle an incoming query
 func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
-	// Ignore answer for now
-	if len(request.query.Answer) > 0 {
+	// RFC 6762 18.3, 18.11: messages with a non-zero opcode or response code are ignored
+	if request.query.Response || request.query.Opcode != dns.OpcodeQuery || request.query.Rcode != dns.RcodeSuccess {
 		return nil
 	}
 	// Ignore questions with Authorative section for now
@@ -383,7 +561,8 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 	if len(request.query.Question) > 0 {
 		for _, q := range request.query.Question {
 			resp = dns.Msg{}
-			resp.SetReply(&request.query)
+			resp.Response = true
+			resp.Authoritative = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 			if err = s.handleQuestion(q, service, &resp); err != nil {
@@ -391,7 +570,7 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 					q, err)
 				continue
 			}
-			// Check if there is an answer
+			resp.Answer = suppressKnown(resp.Answer, request.query.Answer)
 			if len(resp.Answer) > 0 {
 				if isUnicastQuestion(q) {
 					// Send unicast
@@ -400,7 +579,7 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 					}
 				} else {
 					// Send mulicast
-					if e := s.multicastResponse(&resp); e != nil {
+					if e := s.multicastReply(&resp, request.from); e != nil {
 						err = e
 					}
 				}
@@ -417,34 +596,28 @@ func (s *Server) handleQuestion(q dns.Question, service *ServiceEntry, resp *dns
 		return nil
 	}
 
-	var name = strings.ToLower(q.Name)
-
-	switch name {
-	case service.HostName:
-		s.composeHostAnswers(service, isUnicastQuestion(q), resp, s.ttl)
-	case service.ServiceName():
-		s.composeBrowsingAnswers(service, isUnicastQuestion(q), resp, s.ttl)
-	case service.ServiceInstanceName():
-		s.composeLookupAnswers(service, isUnicastQuestion(q), resp, s.ttl)
-	case service.ServiceTypeName():
-		s.serviceTypeName(service, isUnicastQuestion(q), resp, s.ttl)
+	switch canonicalName(q.Name) {
+	case canonicalName(service.HostName):
+		s.composeHostAnswers(service, resp, s.ttl)
+	case canonicalName(service.ServiceName()):
+		s.composeBrowsingAnswers(service, resp, s.ttl)
+	case canonicalName(service.ServiceInstanceName()):
+		s.composeLookupAnswers(service, resp, s.ttl)
+	case canonicalName(service.ServiceTypeName()):
+		s.serviceTypeName(service, resp, s.ttl)
 	}
 
 	return nil
 }
 
-func (s *Server) composeHostAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
-	cacheFlush := uint16(1 << 15)
-	if !useCacheFlush {
-		cacheFlush = 0
-	}
+func (s *Server) composeHostAnswers(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
 
 	for _, ipAddr := range service.AddrsIPv4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
@@ -456,27 +629,22 @@ func (s *Server) composeHostAnswers(service *ServiceEntry, useCacheFlush bool, r
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
 		}
 		resp.Answer = append(resp.Answer, aaaa)
 	}
-	resp.Question = make([]dns.Question, 0)
 }
 
-func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
-	cacheFlush := uint16(1 << 15)
-	if !useCacheFlush {
-		cacheFlush = 0
-	}
+func (s *Server) composeBrowsingAnswers(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
 
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceName(),
 			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
 		Ptr: service.ServiceInstanceName(),
@@ -487,7 +655,7 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET | cacheFlushBit,
 			Ttl:    ttl,
 		},
 		Txt: service.Text,
@@ -496,7 +664,7 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET | cacheFlushBit,
 			Ttl:    ttl,
 		},
 		Priority: 0,
@@ -511,7 +679,7 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
@@ -523,7 +691,7 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
@@ -532,16 +700,8 @@ func (s *Server) composeBrowsingAnswers(service *ServiceEntry, useCacheFlush boo
 	}
 }
 
-func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
-	// From RFC6762
-	//    The most significant bit of the rrclass for a record in the Answer
-	//    Section of a response message is the Multicast DNS cache-flush bit
-	//    and is discussed in more detail below in Section 10.2, "Announcements
-	//    to Flush Outdated Cache Entries".
-	cacheFlush := uint16(1 << 15)
-	if !useCacheFlush {
-		cacheFlush = 0
-	}
+func (s *Server) composeLookupAnswers(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
+	// RFC 6762 10.2: the cache-flush bit goes on unique records only, never on the shared PTRs
 
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
@@ -556,7 +716,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET | cacheFlushBit,
 			Ttl:    ttl,
 		},
 		Priority: 0,
@@ -568,7 +728,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET | cacheFlushBit,
 			Ttl:    ttl,
 		},
 		Txt: service.Text,
@@ -589,7 +749,7 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			A: ipAddr,
@@ -601,21 +761,16 @@ func (s *Server) composeLookupAnswers(service *ServiceEntry, useCacheFlush bool,
 			Hdr: dns.RR_Header{
 				Name:   service.HostName,
 				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cacheFlush,
+				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
 			},
 			AAAA: ipAddr,
 		}
 		resp.Extra = append(resp.Extra, aaaa)
 	}
-	resp.Question = make([]dns.Question, 0)
 }
 
-func (s *Server) serviceTypeName(service *ServiceEntry, useCacheFlush bool, resp *dns.Msg, ttl uint32) {
-	cacheFlush := uint16(1 << 15)
-	if !useCacheFlush {
-		cacheFlush = 0
-	}
+func (s *Server) serviceTypeName(service *ServiceEntry, resp *dns.Msg, ttl uint32) {
 	// From RFC6762
 	// 9.  Service Type Enumeration
 	//
@@ -628,7 +783,7 @@ func (s *Server) serviceTypeName(service *ServiceEntry, useCacheFlush bool, resp
 		Hdr: dns.RR_Header{
 			Name:   service.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET | cacheFlush,
+			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
 		Ptr: service.ServiceName(),
@@ -640,6 +795,7 @@ func (s *Server) serviceTypeName(service *ServiceEntry, useCacheFlush bool, resp
 func (s *Server) announceText(service *ServiceEntry) {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
+	resp.MsgHdr.Authoritative = true
 
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
@@ -658,9 +814,10 @@ func (s *Server) announceText(service *ServiceEntry) {
 func (s *Server) unregister(service *ServiceEntry) error {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
+	resp.MsgHdr.Authoritative = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(service, true, resp, 0)
+	s.composeLookupAnswers(service, resp, 0)
 	return s.multicastResponse(resp)
 }
 
@@ -670,31 +827,157 @@ func (s *Server) unicastResponse(resp *dns.Msg, from net.Addr) error {
 	if err != nil {
 		return err
 	}
-	addr := from.(*net.UDPAddr)
-	if addr.IP.To4() != nil {
-		_, err = s.ipv4conn.WriteToUDP(buf, addr)
-		return err
-	} else {
-		_, err = s.ipv6conn.WriteToUDP(buf, addr)
-		return err
-	}
+	return s.send(buf, from.(*net.UDPAddr))
 }
 
 // multicastResponse us used to send a multicast response packet
-func (c *Server) multicastResponse(msg *dns.Msg) error {
+func (s *Server) multicastResponse(msg *dns.Msg) error {
 	buf, err := msg.Pack()
-
 	if err != nil {
 		log.Println("Failed to pack message!")
 		return err
 	}
-	if c.ipv4conn != nil {
-		c.ipv4conn.WriteTo(buf, ipv4Addr)
+	return s.send(buf, nil)
+}
+
+// multicastReply multicasts the reply to a query from the address from, to the group
+// of the address family that the query came in on. A querier with both families sends
+// its query on both, and each copy is answered: sending every answer to both groups
+// would put the reply on each of them twice.
+func (s *Server) multicastReply(msg *dns.Msg, from net.Addr) error {
+	buf, err := msg.Pack()
+	if err != nil {
+		log.Println("Failed to pack message!")
+		return err
 	}
-	if c.ipv6conn != nil {
-		c.ipv6conn.WriteTo(buf, ipv6Addr)
+	group := ipv6Addr
+	if from.(*net.UDPAddr).IP.To4() != nil {
+		group = ipv4Addr
 	}
-	return nil
+	return s.send(buf, group)
+}
+
+// writePacket sends buf to the querier at addr, to the mDNS group addr of one address
+// family, or to the groups of both families when addr is nil
+func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
+	if addr == nil || addr.IP.IsMulticast() {
+		to4 := addr == nil || addr.IP.To4() != nil
+		to6 := addr == nil || addr.IP.To4() == nil
+		// Multicast on every interface that is up and has an address. Left to the
+		// routing table, a multicast packet leaves on one interface only, and a printer
+		// on both Ethernet and Wi-Fi would announce itself and answer on just one of
+		// them. An interface without an address of a family is not on a network to send
+		// to: a Wi-Fi interface is up before it has joined one.
+		sent := false
+		for _, ifi := range s.multicastInterfaces() {
+			const want = net.FlagUp | net.FlagMulticast
+			if ifi.Flags&want != want || ifi.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, _ := ifi.Addrs()
+			has4, has6 := addressFamilies(addrs)
+			if s.p4 != nil && has4 && to4 {
+				if _, err := s.p4.WriteTo(buf, &ipv4.ControlMessage{IfIndex: ifi.Index}, ipv4Addr); err == nil {
+					sent = true
+				}
+			}
+			if s.p6 != nil && has6 && to6 {
+				if _, err := s.p6.WriteTo(buf, &ipv6.ControlMessage{IfIndex: ifi.Index}, ipv6Addr); err == nil {
+					sent = true
+				}
+			}
+		}
+		if sent {
+			return nil
+		}
+		// no interface took the packet: fall back on the routing table's choice
+		if s.ipv4conn != nil && to4 {
+			s.ipv4conn.WriteTo(buf, ipv4Addr)
+		}
+		if s.ipv6conn != nil && to6 {
+			s.ipv6conn.WriteTo(buf, ipv6Addr)
+		}
+		return nil
+	}
+	if addr.IP.To4() != nil {
+		_, err := s.ipv4conn.WriteToUDP(buf, addr)
+		return err
+	}
+	_, err := s.ipv6conn.WriteToUDP(buf, addr)
+	return err
+}
+
+// addressFamilies reports whether addrs, the addresses of an interface, hold an IPv4
+// and an IPv6 address
+func addressFamilies(addrs []net.Addr) (has4, has6 bool) {
+	for _, addr := range addrs {
+		var ip net.IP
+		switch a := addr.(type) {
+		case *net.IPNet:
+			ip = a.IP
+		case *net.IPAddr:
+			ip = a.IP
+		}
+		switch {
+		case ip == nil:
+		case ip.To4() != nil:
+			has4 = true
+		default:
+			has6 = true
+		}
+	}
+	return has4, has6
+}
+
+// suppressKnown removes the answers that known holds with at least half our TTL (RFC 6762 7.1).
+// A unique record stays when another record of its set does: the cache-flush bit on the
+// one we send would make its receivers drop the ones we left out (RFC 6762 10.2).
+func suppressKnown(answers, known []dns.RR) []dns.RR {
+	isKnown := func(rr dns.RR) bool {
+		return slices.ContainsFunc(known, func(ka dns.RR) bool {
+			return ka.Header().Ttl >= rr.Header().Ttl/2 && sameRecord(rr, ka)
+		})
+	}
+	unknown := slices.DeleteFunc(slices.Clone(answers), isKnown)
+	return slices.DeleteFunc(answers, func(rr dns.RR) bool {
+		return isKnown(rr) && (isShared(rr) || !slices.ContainsFunc(unknown, func(u dns.RR) bool {
+			return u.Header().Rrtype == rr.Header().Rrtype && canonicalName(u.Header().Name) == canonicalName(rr.Header().Name)
+		}))
+	})
+}
+
+// isShared reports whether other responders may hold records of rr's name and type.
+// Of the records we publish, those are the PTRs.
+func isShared(rr dns.RR) bool {
+	return rr.Header().Rrtype == dns.TypePTR
+}
+
+// sameRecord reports whether a and b have the same name, type, class and rdata
+func sameRecord(a, b dns.RR) bool {
+	ha, hb := a.Header(), b.Header()
+	if ha.Rrtype != hb.Rrtype || ha.Class&^cacheFlushBit != hb.Class&^cacheFlushBit ||
+		canonicalName(ha.Name) != canonicalName(hb.Name) {
+		return false
+	}
+	switch ra := a.(type) {
+	case *dns.PTR:
+		rb, ok := b.(*dns.PTR)
+		return ok && canonicalName(ra.Ptr) == canonicalName(rb.Ptr)
+	case *dns.SRV:
+		rb, ok := b.(*dns.SRV)
+		return ok && ra.Priority == rb.Priority && ra.Weight == rb.Weight && ra.Port == rb.Port &&
+			canonicalName(ra.Target) == canonicalName(rb.Target)
+	case *dns.TXT:
+		rb, ok := b.(*dns.TXT)
+		return ok && slices.Equal(ra.Txt, rb.Txt)
+	case *dns.A:
+		rb, ok := b.(*dns.A)
+		return ok && ra.A.Equal(rb.A)
+	case *dns.AAAA:
+		rb, ok := b.(*dns.AAAA)
+		return ok && ra.AAAA.Equal(rb.AAAA)
+	}
+	return false
 }
 
 func isUnicastQuestion(q dns.Question) bool {
