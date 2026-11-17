@@ -119,6 +119,10 @@ type Server struct {
 	iface *net.Interface
 	// Interface names on which the groups were joined. Owned by mainloop once it runs.
 	joined4, joined6 map[string]bool
+	// Truncated queries waiting for the rest of their known answers, by querier address,
+	// and the timer for the one due first. Owned by mainloop.
+	held      map[string]*heldQuery
+	heldTimer <-chan time.Time
 	ipv4conn         *net.UDPConn
 	ipv6conn         *net.UDPConn
 	initialEntry     *ServiceEntry
@@ -320,7 +324,10 @@ func (s *Server) mainloop(entries chan *ServiceEntry) {
 			}
 
 		case req := <-requests:
-			s.handleQuery(entry, req)
+			s.accept(entry, req, time.Now())
+
+		case <-s.heldTimer:
+			s.answerHeld(entry, time.Now())
 		}
 	}
 }
@@ -440,14 +447,98 @@ func (s *Server) recv(c *net.UDPConn, requests chan *Request) {
 func (s *Server) parsePacket(packet []byte, from net.Addr) (*Request, error) {
 	var request Request
 	request.from = from
-	// ErrTruncated only reports the TC bit; the message is fully unpacked. A truncated
-	// query is answered like any other. Its known answers go on in further packets,
-	// which are not waited for: at worst we repeat an answer the querier listed there.
+	// ErrTruncated only reports the TC bit; the message is fully unpacked
 	if err := request.query.Unpack(packet); err != nil && err != dns.ErrTruncated {
 		log.Printf("[ERR] bonjour: Failed to unpack packet: %v", err)
 		return nil, err
 	}
 	return &request, nil
+}
+
+// How long a truncated query waits for the packets that continue its known-answer
+// list (RFC 6762 7.2 asks for 400-500 ms), the longest it waits when those packets
+// are truncated themselves, and how many queriers may be waiting at once
+const (
+	truncatedWait    = 450 * time.Millisecond
+	truncatedMaxWait = 2 * time.Second
+	maxHeldQueries   = 64
+)
+
+// heldQuery is a truncated query waiting for the rest of its known answers
+type heldQuery struct {
+	request *Request
+	// when to answer, and the latest that further truncated packets may put that off to
+	due, latest time.Time
+}
+
+// accept takes in a packet received at now. A query is answered at once unless it is
+// truncated: a querier that knows more records than fit in one packet sets the TC bit
+// and lists the rest in packets without a question. Answering before those arrive
+// would repeat records the querier is about to say it has, on every query, for as
+// long as its list does not fit. Such a query is held until the list is complete.
+//
+// Each querier's query is held on its own, so one querier's wait delays nobody else.
+func (s *Server) accept(service *ServiceEntry, request *Request, now time.Time) {
+	q := &request.query
+	if q.Response || q.Opcode != dns.OpcodeQuery || q.Rcode != dns.RcodeSuccess {
+		return
+	}
+	from := request.from.String()
+	if h := s.held[from]; h != nil {
+		if len(q.Question) == 0 {
+			// the next part of the known-answer list
+			h.request.query.Answer = append(h.request.query.Answer, q.Answer...)
+			if q.Truncated {
+				h.due = minTime(now.Add(truncatedWait), h.latest)
+				s.armHeld(now)
+			}
+			return
+		}
+		// a new query from the querier: the list of the held one is not going to be continued
+		delete(s.held, from)
+		s.handleQuery(service, h.request)
+	}
+	if !q.Truncated || len(q.Question) == 0 || len(s.held) >= maxHeldQueries {
+		s.handleQuery(service, request)
+		return
+	}
+	if s.held == nil {
+		s.held = map[string]*heldQuery{}
+	}
+	s.held[from] = &heldQuery{request: request, due: now.Add(truncatedWait), latest: now.Add(truncatedMaxWait)}
+	s.armHeld(now)
+}
+
+// answerHeld answers the held queries whose wait is over at now
+func (s *Server) answerHeld(service *ServiceEntry, now time.Time) {
+	for from, h := range s.held {
+		if !h.due.After(now) {
+			delete(s.held, from)
+			s.handleQuery(service, h.request)
+		}
+	}
+	s.armHeld(now)
+}
+
+// armHeld sets the timer for the held query that is due first
+func (s *Server) armHeld(now time.Time) {
+	s.heldTimer = nil
+	var first time.Time
+	for _, h := range s.held {
+		if first.IsZero() || h.due.Before(first) {
+			first = h.due
+		}
+	}
+	if !first.IsZero() {
+		s.heldTimer = time.After(first.Sub(now))
+	}
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 // handleQuery is used to handle an incoming query

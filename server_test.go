@@ -283,34 +283,114 @@ func TestResponseHeader(t *testing.T) {
 	}
 }
 
+// accept packs query as a client would and runs it through the path packets take from
+// the sockets, where truncated queries are held
+func accept(t *testing.T, s *Server, entry *ServiceEntry, query *dns.Msg, from *net.UDPAddr, now time.Time) {
+	t.Helper()
+	buf, err := query.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := s.parsePacket(buf, from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.accept(entry, req, now)
+}
+
 // A querier that knows more printers than fit in one packet sets the TC bit and lists
-// the rest in further packets. Such a query is answered, with the known answers it
-// holds itself applied, and the packets that continue it are not answered.
-func TestTruncatedQueriesAreAnswered(t *testing.T) {
+// the rest in further packets, which hold no question. Its query is held until those
+// have had time to arrive, and answered with all its known answers applied.
+func TestTruncatedQueriesWaitForTheirKnownAnswers(t *testing.T) {
 	entry := testEntry(t)
+	other := &net.UDPAddr{IP: net.ParseIP("10.35.9.69"), Port: 5353}
+	known := func(instance string, truncated bool) *dns.Msg {
+		m := browseWithKnownAnswer(entry, instance, 300)
+		m.Question = nil
+		m.Truncated = truncated
+		return m
+	}
 	for _, c := range []struct {
-		desc     string
-		instance string
-		want     int
+		desc          string
+		first         string // instance listed in the query itself
+		continuations []*dns.Msg
+		contFrom      *net.UDPAddr
+		want          int
 	}{
-		{"our record not among the known answers", "Formlabs Form 4 Other", 1},
-		{"our record among the known answers", entry.Instance, 0},
+		{"no continuation arrives", "Formlabs Form 4 Other", nil, querier, 1},
+		{"continuation does not list us", "Formlabs Form 4 Other", []*dns.Msg{known("Formlabs Form 4 Another", false)}, querier, 1},
+		{"continuation lists us", "Formlabs Form 4 Other", []*dns.Msg{known(entry.Instance, false)}, querier, 0},
+		{"second continuation lists us", "Formlabs Form 4 Other", []*dns.Msg{known("Formlabs Form 4 Another", true), known(entry.Instance, false)}, querier, 0},
+		{"query itself lists us", entry.Instance, nil, querier, 0},
+		{"another host lists us", "Formlabs Form 4 Other", []*dns.Msg{known(entry.Instance, false)}, other, 1},
 	} {
 		s, sent := testServer(t)
-		q := browseWithKnownAnswer(entry, c.instance, 300)
+		now := time.Now()
+		q := browseWithKnownAnswer(entry, c.first, 300)
 		q.Truncated = true
-		receive(t, s, entry, q, querier)
-		if len(*sent) != c.want {
-			t.Errorf("%s: got %d replies, want %d", c.desc, len(*sent), c.want)
+		accept(t, s, entry, q, querier, now)
+		for i, cont := range c.continuations {
+			accept(t, s, entry, cont, c.contFrom, now.Add(time.Duration(i+1)*10*time.Millisecond))
 		}
-		// the continuation holds known answers and no question
-		*sent = nil
-		cont := browseWithKnownAnswer(entry, "Formlabs Form 4 Another", 300)
-		cont.Question = nil
-		receive(t, s, entry, cont, querier)
+		if len(*sent) != 0 || len(s.held) != 1 || s.heldTimer == nil {
+			t.Fatalf("%s: %d replies sent and %d queries held before the wait is over, want 0 and 1", c.desc, len(*sent), len(s.held))
+		}
+		s.answerHeld(entry, now.Add(truncatedWait-time.Millisecond))
 		if len(*sent) != 0 {
-			t.Errorf("%s: got %d replies to the continuation packet, want 0", c.desc, len(*sent))
+			t.Fatalf("%s: answered before the wait was over", c.desc)
 		}
+		s.answerHeld(entry, now.Add(truncatedWait+20*time.Millisecond))
+		if len(*sent) != c.want || len(s.held) != 0 || s.heldTimer != nil {
+			t.Errorf("%s: %d replies sent and %d queries still held, want %d and 0", c.desc, len(*sent), len(s.held), c.want)
+		}
+	}
+}
+
+// Queries that are not truncated are answered at once, also while another querier's
+// truncated query waits, and a querier cannot make its own wait last forever
+func TestTruncatedQueryWaitIsBounded(t *testing.T) {
+	entry := testEntry(t)
+	other := &net.UDPAddr{IP: net.ParseIP("10.35.9.69"), Port: 5353}
+	s, sent := testServer(t)
+	now := time.Now()
+	tc := browseWithKnownAnswer(entry, "Formlabs Form 4 Other", 300)
+	tc.Truncated = true
+	accept(t, s, entry, tc, querier, now)
+
+	plain := new(dns.Msg)
+	plain.Question = []dns.Question{question(entry.ServiceName(), dns.TypePTR, false)}
+	accept(t, s, entry, plain, other, now)
+	if len(*sent) != 1 || len(s.held) != 1 {
+		t.Fatalf("%d replies sent and %d queries held after another host's plain query, want 1 and 1", len(*sent), len(s.held))
+	}
+
+	// truncated continuations keep arriving; the answer goes out by the limit all the same
+	more := browseWithKnownAnswer(entry, "Formlabs Form 4 Another", 300)
+	more.Question = nil
+	more.Truncated = true
+	for at := now; at.Before(now.Add(3 * time.Second)); at = at.Add(100 * time.Millisecond) {
+		accept(t, s, entry, more, querier, at)
+		s.answerHeld(entry, at)
+	}
+	if len(*sent) != 2 || len(s.held) != 0 {
+		t.Errorf("%d replies sent and %d queries held after 3 s of truncated continuations, want 2 and 0", len(*sent), len(s.held))
+	}
+
+	// a new query from a querier whose query is held ends the wait for the held one
+	*sent = nil
+	accept(t, s, entry, tc, querier, now)
+	accept(t, s, entry, plain, querier, now.Add(50*time.Millisecond))
+	if len(*sent) != 2 || len(s.held) != 0 {
+		t.Errorf("%d replies sent and %d queries held after a second query from the same host, want 2 and 0", len(*sent), len(s.held))
+	}
+
+	// with too many queriers waiting, further truncated queries are answered at once
+	*sent = nil
+	for i := 0; i < maxHeldQueries+5; i++ {
+		accept(t, s, entry, tc, &net.UDPAddr{IP: net.IPv4(10, 35, 10, byte(i)), Port: 5353}, now)
+	}
+	if len(s.held) != maxHeldQueries || len(*sent) != 5 {
+		t.Errorf("%d queries held and %d answered at once, want %d and 5", len(s.held), len(*sent), maxHeldQueries)
 	}
 }
 
