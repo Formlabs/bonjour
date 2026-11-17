@@ -1,4 +1,4 @@
-module github.com/Formlabs/bonjour
+module github.com/Formlabs/bonjour/v2
 
 go 1.21
 
