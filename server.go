@@ -131,7 +131,8 @@ type Server struct {
 	waitGroup        sync.WaitGroup
 	shutdownLock     sync.Mutex
 	ttl              uint32
-	// send writes a packet to addr, or to both multicast groups when addr is nil
+	// send writes a packet to addr, which is a querier or one of the mDNS groups, or to
+	// both groups when addr is nil
 	send func(buf []byte, addr *net.UDPAddr) error
 }
 
@@ -578,7 +579,7 @@ func (s *Server) handleQuery(service *ServiceEntry, request *Request) error {
 					}
 				} else {
 					// Send mulicast
-					if e := s.multicastResponse(&resp); e != nil {
+					if e := s.multicastReply(&resp, request.from); e != nil {
 						err = e
 					}
 				}
@@ -839,8 +840,29 @@ func (s *Server) multicastResponse(msg *dns.Msg) error {
 	return s.send(buf, nil)
 }
 
+// multicastReply multicasts the reply to a query from the address from, to the group
+// of the address family that the query came in on. A querier with both families sends
+// its query on both, and each copy is answered: sending every answer to both groups
+// would put the reply on each of them twice.
+func (s *Server) multicastReply(msg *dns.Msg, from net.Addr) error {
+	buf, err := msg.Pack()
+	if err != nil {
+		log.Println("Failed to pack message!")
+		return err
+	}
+	group := ipv6Addr
+	if from.(*net.UDPAddr).IP.To4() != nil {
+		group = ipv4Addr
+	}
+	return s.send(buf, group)
+}
+
+// writePacket sends buf to the querier at addr, to the mDNS group addr of one address
+// family, or to the groups of both families when addr is nil
 func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
-	if addr == nil {
+	if addr == nil || addr.IP.IsMulticast() {
+		to4 := addr == nil || addr.IP.To4() != nil
+		to6 := addr == nil || addr.IP.To4() == nil
 		// Multicast on every interface that is up and has an address. Left to the
 		// routing table, a multicast packet leaves on one interface only, and a printer
 		// on both Ethernet and Wi-Fi would announce itself and answer on just one of
@@ -854,12 +876,12 @@ func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
 			}
 			addrs, _ := ifi.Addrs()
 			has4, has6 := addressFamilies(addrs)
-			if s.p4 != nil && has4 {
+			if s.p4 != nil && has4 && to4 {
 				if _, err := s.p4.WriteTo(buf, &ipv4.ControlMessage{IfIndex: ifi.Index}, ipv4Addr); err == nil {
 					sent = true
 				}
 			}
-			if s.p6 != nil && has6 {
+			if s.p6 != nil && has6 && to6 {
 				if _, err := s.p6.WriteTo(buf, &ipv6.ControlMessage{IfIndex: ifi.Index}, ipv6Addr); err == nil {
 					sent = true
 				}
@@ -869,10 +891,10 @@ func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
 			return nil
 		}
 		// no interface took the packet: fall back on the routing table's choice
-		if s.ipv4conn != nil {
+		if s.ipv4conn != nil && to4 {
 			s.ipv4conn.WriteTo(buf, ipv4Addr)
 		}
-		if s.ipv6conn != nil {
+		if s.ipv6conn != nil && to6 {
 			s.ipv6conn.WriteTo(buf, ipv6Addr)
 		}
 		return nil

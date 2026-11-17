@@ -14,8 +14,9 @@ import (
 var querier = &net.UDPAddr{IP: net.ParseIP("10.35.9.68"), Port: 5353}
 
 type sentPacket struct {
-	msg dns.Msg
-	to  *net.UDPAddr
+	msg   dns.Msg
+	to    *net.UDPAddr
+	group *net.UDPAddr // for a multicast packet sent to one family, that family's group
 }
 
 func testEntry(t *testing.T) *ServiceEntry {
@@ -34,6 +35,11 @@ func testServer(t *testing.T) (*Server, *[]sentPacket) {
 	s := &Server{ttl: 300}
 	s.send = func(buf []byte, addr *net.UDPAddr) error {
 		p := sentPacket{to: addr}
+		// a multicast packet has no destination host, and the group it went to if it
+		// went to one family only
+		if addr != nil && addr.IP.IsMulticast() {
+			p.to, p.group = nil, addr
+		}
 		if err := p.msg.Unpack(buf); err != nil {
 			t.Fatal(err)
 		}
@@ -551,5 +557,49 @@ func TestAddressFamilies(t *testing.T) {
 		if has4, has6 := addressFamilies(c.addrs); has4 != c.has4 || has6 != c.has6 {
 			t.Errorf("%s: got IPv4 %v and IPv6 %v, want %v and %v", c.desc, has4, has6, c.has4, c.has6)
 		}
+	}
+}
+
+// A multicast reply goes to the group of the family the query came in on. A querier
+// with both families asks on both, and would otherwise get every reply twice on each.
+func TestMulticastRepliesStayOnTheQuerysFamily(t *testing.T) {
+	entry := testEntry(t)
+	q := new(dns.Msg)
+	q.Question = []dns.Question{question(entry.ServiceName(), dns.TypePTR, false)}
+	for _, c := range []struct {
+		from *net.UDPAddr
+		want *net.UDPAddr
+	}{
+		{querier, ipv4Addr},
+		{&net.UDPAddr{IP: net.ParseIP("fe80::70b0:4970:ef1a:ad2a"), Port: 5353, Zone: "eth0"}, ipv6Addr},
+	} {
+		s, sent := testServer(t)
+		receive(t, s, entry, q, c.from)
+		if len(*sent) != 1 || (*sent)[0].to != nil || (*sent)[0].group != c.want {
+			t.Fatalf("query from %v: %d replies, to %v, group %v; want 1 reply to group %v", c.from, len(*sent), (*sent)[0].to, (*sent)[0].group, c.want)
+		}
+	}
+
+	// a truncated query that was held is answered on its family too
+	s, sent := testServer(t)
+	tc := browseWithKnownAnswer(entry, "Formlabs Form 4 Other", 300)
+	tc.Question = q.Question
+	tc.Truncated = true
+	now := time.Now()
+	accept(t, s, entry, tc, &net.UDPAddr{IP: net.ParseIP("fe80::1"), Port: 5353}, now)
+	s.answerHeld(entry, now.Add(time.Second))
+	if len(*sent) != 1 || (*sent)[0].group != ipv6Addr {
+		t.Errorf("held query from an IPv6 host: %d replies, want 1 to the IPv6 group", len(*sent))
+	}
+
+	// announcements still go to both families
+	s, sent = testServer(t)
+	announcement := new(dns.Msg)
+	s.composeLookupAnswers(entry, announcement, s.ttl)
+	if err := s.multicastResponse(announcement); err != nil {
+		t.Fatal(err)
+	}
+	if len(*sent) != 1 || (*sent)[0].to != nil || (*sent)[0].group != nil {
+		t.Errorf("announcement went to group %v, want both", (*sent)[0].group)
 	}
 }
