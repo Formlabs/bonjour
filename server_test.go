@@ -524,3 +524,32 @@ func TestKeepAliveAnnouncements(t *testing.T) {
 		t.Errorf("%d announcements in the 9 intervals after a change, want %d", n, announceCount)
 	}
 }
+
+// Multicast packets go out on an interface only for the address families it has an
+// address of
+func TestAddressFamilies(t *testing.T) {
+	ipnet := func(s string) net.Addr {
+		ip, n, err := net.ParseCIDR(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n.IP = ip
+		return n
+	}
+	for _, c := range []struct {
+		desc       string
+		addrs      []net.Addr
+		has4, has6 bool
+	}{
+		{"no addresses, as on Wi-Fi that has not joined a network", nil, false, false},
+		{"IPv4 only", []net.Addr{ipnet("10.35.6.90/21")}, true, false},
+		{"link-local IPv6 only", []net.Addr{ipnet("fe80::2ecf:67ff:fee3:91a0/64")}, false, true},
+		{"both", []net.Addr{ipnet("10.35.6.90/21"), ipnet("fe80::2ecf:67ff:fee3:91a0/64")}, true, true},
+		{"an address without a mask", []net.Addr{&net.IPAddr{IP: net.ParseIP("192.168.1.5")}}, true, false},
+		{"an address of another kind", []net.Addr{&net.UnixAddr{Name: "x"}}, false, false},
+	} {
+		if has4, has6 := addressFamilies(c.addrs); has4 != c.has4 || has6 != c.has6 {
+			t.Errorf("%s: got IPv4 %v and IPv6 %v, want %v and %v", c.desc, has4, has6, c.has4, c.has6)
+		}
+	}
+}

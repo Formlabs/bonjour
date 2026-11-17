@@ -841,21 +841,25 @@ func (s *Server) multicastResponse(msg *dns.Msg) error {
 
 func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
 	if addr == nil {
-		// Multicast on every interface that is up. Left to the routing table, a
-		// multicast packet leaves on one interface only, and a printer on both
-		// Ethernet and Wi-Fi would announce itself and answer on just one of them.
+		// Multicast on every interface that is up and has an address. Left to the
+		// routing table, a multicast packet leaves on one interface only, and a printer
+		// on both Ethernet and Wi-Fi would announce itself and answer on just one of
+		// them. An interface without an address of a family is not on a network to send
+		// to: a Wi-Fi interface is up before it has joined one.
 		sent := false
 		for _, ifi := range s.multicastInterfaces() {
 			const want = net.FlagUp | net.FlagMulticast
 			if ifi.Flags&want != want || ifi.Flags&net.FlagLoopback != 0 {
 				continue
 			}
-			if s.p4 != nil {
+			addrs, _ := ifi.Addrs()
+			has4, has6 := addressFamilies(addrs)
+			if s.p4 != nil && has4 {
 				if _, err := s.p4.WriteTo(buf, &ipv4.ControlMessage{IfIndex: ifi.Index}, ipv4Addr); err == nil {
 					sent = true
 				}
 			}
-			if s.p6 != nil {
+			if s.p6 != nil && has6 {
 				if _, err := s.p6.WriteTo(buf, &ipv6.ControlMessage{IfIndex: ifi.Index}, ipv6Addr); err == nil {
 					sent = true
 				}
@@ -879,6 +883,28 @@ func (s *Server) writePacket(buf []byte, addr *net.UDPAddr) error {
 	}
 	_, err := s.ipv6conn.WriteToUDP(buf, addr)
 	return err
+}
+
+// addressFamilies reports whether addrs, the addresses of an interface, hold an IPv4
+// and an IPv6 address
+func addressFamilies(addrs []net.Addr) (has4, has6 bool) {
+	for _, addr := range addrs {
+		var ip net.IP
+		switch a := addr.(type) {
+		case *net.IPNet:
+			ip = a.IP
+		case *net.IPAddr:
+			ip = a.IP
+		}
+		switch {
+		case ip == nil:
+		case ip.To4() != nil:
+			has4 = true
+		default:
+			has6 = true
+		}
+	}
+	return has4, has6
 }
 
 // suppressKnown removes the answers that known holds with at least half our TTL (RFC 6762 7.1).
